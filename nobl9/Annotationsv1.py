@@ -43,17 +43,17 @@ SLO_NAME = "The name of your SLO (real name not display name)"
 ANNOTATION_NAME = "The Name of your annotation"
 ANNOTATION_DATA = "Blurb of Text for your annotation"
 
-# Set Annotation time period. If you want to set a particular time go to line 48. 
+# Set Annotation time period. If you want to set a particular time, comment out line 48 and 49 and go to line 52 to set your specific time. 
 
 now = datetime.utcnow()
-since = now + timedelta(minutes=5) #  5 mimutes change the minutes= to something longer if you like.
+since = now + timedelta(minutes=5) #  5 mimutes, change the minutes= to something longer if you like.
 
 # RFC 3339 timestamp. Nobl9 needs this.
 # Set varibles. If you want a specific time use this format. 
 # FROM = "2021-11-25T14:10:00.000Z"
 # TO = "2021-12-25T14:10:00.000Z"
 
-# Uncomment these to use the auto set time from now to plus what ever you set above. (line 45)
+# Uncomment these to use the auto set time from now to plus what ever you set above. (line 49)
 FROM = rfc3339.rfc3339(since)
 TO = rfc3339.rfc3339(now)
 
