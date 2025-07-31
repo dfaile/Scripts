@@ -1,6 +1,17 @@
-# Nobl9 Quality Gate for CI/CD
+# Nobl9 SLO Tools for CI/CD
 
-This script integrates with Nobl9's SLO Status API v2 to create quality gates for CI/CD pipelines. It checks the error budget remaining for a specified SLO and determines whether to proceed with a deployment.
+This repository contains two scripts that integrate with Nobl9's SLO Status API v2:
+
+1. **Nobl9_QualityGate_PP.py** - Quality gate for CI/CD pipelines
+2. **Nobl9_SLO_Info.py** - SLO information display tool
+
+## Scripts Overview
+
+### Nobl9_QualityGate_PP.py
+Creates quality gates for CI/CD pipelines. It checks the error budget remaining for a specified SLO and determines whether to proceed with a deployment.
+
+### Nobl9_SLO_Info.py
+Displays comprehensive SLO information in human-readable format with optional JSON output. Useful for monitoring, reporting, and debugging SLO configurations.
 
 ## Features
 
@@ -19,7 +30,9 @@ pip install requests
 
 ## Usage
 
-### Basic Usage
+### Quality Gate Script (Nobl9_QualityGate_PP.py)
+
+#### Basic Usage
 
 ```bash
 python Nobl9_QualityGate_PP.py \
@@ -29,7 +42,7 @@ python Nobl9_QualityGate_PP.py \
   --client-secret "your-client-secret"
 ```
 
-### Advanced Usage
+#### Advanced Usage
 
 ```bash
 python Nobl9_QualityGate_PP.py \
@@ -46,15 +59,64 @@ python Nobl9_QualityGate_PP.py \
   --json-output
 ```
 
+### SLO Information Script (Nobl9_SLO_Info.py)
+
+#### Human-Readable Output (Default)
+
+```bash
+python Nobl9_SLO_Info.py \
+  --slo-name "prod-latency" \
+  --project "software-slo" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
+#### Compact Summary
+
+```bash
+python Nobl9_SLO_Info.py \
+  --slo-name "prod-latency" \
+  --project "software-slo" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret" \
+  --compact
+```
+
+#### JSON Output
+
+```bash
+python Nobl9_SLO_Info.py \
+  --slo-name "prod-latency" \
+  --project "software-slo" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret" \
+  --json-output
+```
+
+#### With Additional Fields and Time Range
+
+```bash
+python Nobl9_SLO_Info.py \
+  --slo-name "api-availability" \
+  --project "backend" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret" \
+  --fields "counts" \
+  --from "2024-01-25T00:00:00Z" \
+  --to "2024-01-25T23:59:59Z"
+```
+
 ## Command Line Arguments
 
-### Required Arguments
+### Quality Gate Script (Nobl9_QualityGate_PP.py)
+
+#### Required Arguments
 - `--slo-name`: Name of the SLO to check
 - `--project`: Project name containing the SLO
 - `--client-id`: Nobl9 client ID
 - `--client-secret`: Nobl9 client secret
 
-### Optional Arguments
+#### Optional Arguments
 - `--organization`: Nobl9 organization ID (default: "software")
 - `--base-url`: Nobl9 API base URL (default: "https://app.nobl9.com")
 - `--threshold`: Minimum error budget percentage required (default: 0.0)
@@ -67,6 +129,23 @@ python Nobl9_QualityGate_PP.py \
 - `--to`: End time for data range (RFC3339 format)
 - `--verbose, -v`: Enable verbose output
 - `--json-output`: Output SLO data as JSON
+
+### SLO Information Script (Nobl9_SLO_Info.py)
+
+#### Required Arguments
+- `--slo-name`: Name of the SLO to display
+- `--project`: Project name containing the SLO
+- `--client-id`: Nobl9 client ID
+- `--client-secret`: Nobl9 client secret
+
+#### Optional Arguments
+- `--organization`: Nobl9 organization ID (default: "software")
+- `--base-url`: Nobl9 API base URL (default: "https://app.nobl9.com")
+- `--fields`: Additional fields to request (e.g., "counts")
+- `--from`: Start time for data range (RFC3339 format)
+- `--to`: End time for data range (RFC3339 format)
+- `--json-output`: Output SLO data as JSON instead of human-readable format
+- `--compact`: Show compact summary only (when not using --json-output)
 
 ## CI/CD Integration
 
@@ -182,8 +261,13 @@ deploy:
 
 ## Exit Codes
 
+### Quality Gate Script
 - `0`: Quality gate passed - proceed with deployment
 - `1`: Quality gate failed - cancel deployment
+
+### SLO Information Script
+- `0`: Success - SLO information retrieved
+- `1`: Error - Failed to retrieve SLO information
 
 ## Error Handling
 
