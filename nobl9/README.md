@@ -1,9 +1,10 @@
 # Nobl9 SLO Tools for CI/CD
 
-This repository contains two scripts that integrate with Nobl9's SLO Status API v2:
+This repository contains three scripts that integrate with Nobl9's APIs:
 
 1. **Nobl9_QualityGate_PP.py** - Quality gate for CI/CD pipelines
 2. **Nobl9_SLO_Info.py** - SLO information display tool
+3. **Nobl9_Annotations.py** - Annotations management tool
 
 ## Scripts Overview
 
@@ -12,6 +13,9 @@ Creates quality gates for CI/CD pipelines. It checks the error budget remaining 
 
 ### Nobl9_SLO_Info.py
 Displays comprehensive SLO information in human-readable format with optional JSON output. Useful for monitoring, reporting, and debugging SLO configurations.
+
+### Nobl9_Annotations.py
+Manages SLO annotations using the Nobl9 Annotations API. Supports creating, listing, and deleting annotations for individual SLOs or all SLOs in a project. Useful for marking deployments, maintenance windows, and other events that affect SLO performance.
 
 ## Features
 
@@ -106,6 +110,81 @@ python Nobl9_SLO_Info.py \
   --to "2024-01-25T23:59:59Z"
 ```
 
+### Annotations Script (Nobl9_Annotations.py)
+
+#### Create Annotation for Specific SLO
+
+```bash
+python Nobl9_Annotations.py create \
+  --project "software-slo" \
+  --slo-name "prod-latency" \
+  --name "deployment-v1.2.3" \
+  --description "Production deployment of version 1.2.3" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
+#### Create Annotation for All SLOs in Project
+
+```bash
+python Nobl9_Annotations.py create \
+  --project "software-slo" \
+  --all-slos \
+  --name "maintenance-window" \
+  --description "Scheduled maintenance window" \
+  --duration-minutes 30 \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
+#### Create Annotation with Labels
+
+```bash
+python Nobl9_Annotations.py create \
+  --project "software-slo" \
+  --slo-name "prod-latency" \
+  --name "database-migration" \
+  --description "Database schema migration" \
+  --labels '{"environment":["prod"],"team":["backend"],"type":["maintenance"]}' \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
+#### List Annotations
+
+```bash
+# List all annotations in project
+python Nobl9_Annotations.py list \
+  --project "software-slo" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+
+# List annotations for specific SLO
+python Nobl9_Annotations.py list \
+  --project "software-slo" \
+  --slo-name "prod-latency" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+
+# List annotations with time filter
+python Nobl9_Annotations.py list \
+  --project "software-slo" \
+  --from "2024-01-25T00:00:00Z" \
+  --to "2024-01-25T23:59:59Z" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
+#### Delete Annotation
+
+```bash
+python Nobl9_Annotations.py delete \
+  --project "software-slo" \
+  --name "deployment-v1.2.3" \
+  --client-id "your-client-id" \
+  --client-secret "your-client-secret"
+```
+
 ## Command Line Arguments
 
 ### Quality Gate Script (Nobl9_QualityGate_PP.py)
@@ -146,6 +225,38 @@ python Nobl9_SLO_Info.py \
 - `--to`: End time for data range (RFC3339 format)
 - `--json-output`: Output SLO data as JSON instead of human-readable format
 - `--compact`: Show compact summary only (when not using --json-output)
+
+### Annotations Script (Nobl9_Annotations.py)
+
+#### Global Arguments
+- `--organization`: Nobl9 organization ID (default: "software")
+- `--base-url`: Nobl9 API base URL (default: "https://app.nobl9.com")
+- `--client-id`: Nobl9 client ID (required)
+- `--client-secret`: Nobl9 client secret (required)
+- `--verbose, -v`: Enable verbose output
+
+#### Create Command
+- `--project`: Project name (required)
+- `--slo-name`: SLO name (use --all-slos to annotate all SLOs in project)
+- `--all-slos`: Create annotation for all SLOs in the project
+- `--name`: Annotation name (required)
+- `--description`: Annotation description (required)
+- `--start-time`: Start time (RFC3339 format, default: now)
+- `--end-time`: End time (RFC3339 format, default: now + 5 minutes)
+- `--duration-minutes`: Duration in minutes from now (default: 5)
+- `--labels`: Labels as JSON string (e.g., '{"environment":["prod"],"team":["backend"]}')
+
+#### List Command
+- `--project`: Project name (required)
+- `--slo-name`: Filter by SLO name
+- `--from`: Filter by start time (RFC3339 format)
+- `--to`: Filter by end time (RFC3339 format)
+- `--name`: Filter by annotation name(s), comma-separated
+- `--json-output`: Output as JSON
+
+#### Delete Command
+- `--project`: Project name (required)
+- `--name`: Annotation name to delete (required)
 
 ## CI/CD Integration
 
@@ -268,6 +379,10 @@ deploy:
 ### SLO Information Script
 - `0`: Success - SLO information retrieved
 - `1`: Error - Failed to retrieve SLO information
+
+### Annotations Script
+- `0`: Success - Annotation operation completed
+- `1`: Error - Failed to complete annotation operation
 
 ## Error Handling
 
