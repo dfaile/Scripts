@@ -1,139 +1,216 @@
 #!/usr/bin/env python3
 
-from enum import Enum
-from datetime import datetime, timedelta
+import argparse
 import configparser
 import sys
 import json
 import requests
-import rfc3339
+import base64
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
 
-# Fill these out with your ORG ID, a Project Name (not display name) and a SLO Name 
-URL = "https://app.nobl9.com"
-ORGANIZATION = "software"
-PROJECT = "software-slo"
-SLO_NAME = "prod-latency"
+class Nobl9QualityGate:
+    """Nobl9 Quality Gate for CI/CD integration using SLO Status API v2"""
+    
+    def __init__(self, organization: str, client_id: str, client_secret: str, 
+                 base_url: str = "https://app.nobl9.com"):
+        self.organization = organization
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.base_url = base_url
+        self.access_token = None
+    
+    def get_access_token(self) -> str:
+        """Get access token from Nobl9 API"""
+        if self.access_token:
+            return self.access_token
+            
+        # Create Basic auth header
+        credentials = f"{self.client_id}:{self.client_secret}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        
+        response = requests.post(
+            f"{self.base_url}/api/accessToken",
+            headers={
+                "Authorization": f"Basic {encoded_credentials}",
+                "Organization": self.organization,
+                "Accept": "application/json; version=v1alpha"
+            }
+        )
+        
+        if response.status_code == 200:
+            self.access_token = response.json()["access_token"]
+            return self.access_token
+        else:
+            raise Exception(f"Failed to get access token: {response.status_code} - {response.text}")
+    
+    def get_slo_status(self, slo_name: str, project: str, 
+                      from_time: Optional[str] = None, 
+                      to_time: Optional[str] = None,
+                      fields: Optional[str] = None) -> Dict[str, Any]:
+        """Get SLO status using the v2 API"""
+        token = self.get_access_token()
+        
+        # Build query parameters
+        params = {}
+        if from_time and to_time:
+            params["from"] = from_time
+            params["to"] = to_time
+        if fields:
+            params["fields"] = fields
+        
+        response = requests.get(
+            f"{self.base_url}/api/v2/slos/{slo_name}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Organization": self.organization,
+                "Project": project
+            },
+            params=params
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            raise Exception(f"SLO '{slo_name}' not found in project '{project}'")
+        elif response.status_code == 403:
+            raise Exception(f"Access forbidden to SLO '{slo_name}' in project '{project}'")
+        elif response.status_code == 429:
+            raise Exception("API rate limit exceeded. Please wait and try again.")
+        else:
+            raise Exception(f"API request failed: {response.status_code} - {response.text}")
+    
+    def evaluate_quality_gate(self, slo_data: Dict[str, Any], 
+                            threshold: float = 0.0) -> tuple[bool, float]:
+        """
+        Evaluate quality gate based on error budget remaining percentage
+        
+        Args:
+            slo_data: SLO data from API
+            threshold: Minimum error budget percentage required (0.0 = any remaining budget)
+        
+        Returns:
+            tuple: (pass_gate, error_budget_percentage)
+        """
+        try:
+            # Check if SLO has objectives
+            if not slo_data.get("objectives"):
+                raise Exception("SLO has no objectives defined")
+            
+            # Get the first objective's error budget remaining percentage
+            objective = slo_data["objectives"][0]
+            error_budget_percentage = objective.get("errorBudgetRemainingPercentage", 0.0)
+            
+            # Convert to percentage for easier reading
+            error_budget_percentage_pct = error_budget_percentage * 100
+            
+            # Pass if error budget remaining is above threshold
+            pass_gate = error_budget_percentage_pct > threshold
+            
+            return pass_gate, error_budget_percentage_pct
+            
+        except KeyError as e:
+            raise Exception(f"Required field missing in SLO data: {e}")
+        except Exception as e:
+            raise Exception(f"Error evaluating quality gate: {e}")
 
-#Grab this from your SLO CTL file. 
-CLIENT_ID = "YOURclienIdHERE"
-CLIENT_SECRET = "YOURclientSecretHERE"
-
-
-# Go get an access token for the API.
-# Need to clean this up later to test first then if bad go get a new one.
-
-
-TOKEN = requests.post(
-        f"{URL}/api/accessToken",
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        headers={"organization": ORGANIZATION},
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Nobl9 Quality Gate for CI/CD integration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --slo-name "prod-latency" --project "software-slo" --client-id "your-id" --client-secret "your-secret"
+  %(prog)s --slo-name "api-availability" --project "backend" --threshold 10.0 --organization "my-org"
+  %(prog)s --slo-name "db-performance" --project "data" --fields "counts" --from "2024-01-25T00:00:00Z" --to "2024-01-25T23:59:59Z"
+        """
     )
-if TOKEN.status_code == 200:
-    print("We have a token")
-else:
-    print("We didn't get a token")
-    print(TOKEN.text)
-    exit(1)
+    
+    # Required arguments
+    parser.add_argument("--slo-name", required=True,
+                       help="Name of the SLO to check")
+    parser.add_argument("--project", required=True,
+                       help="Project name containing the SLO")
+    parser.add_argument("--client-id", required=True,
+                       help="Nobl9 client ID")
+    parser.add_argument("--client-secret", required=True,
+                       help="Nobl9 client secret")
+    
+    # Optional arguments
+    parser.add_argument("--organization", default="software",
+                       help="Nobl9 organization ID (default: software)")
+    parser.add_argument("--base-url", default="https://app.nobl9.com",
+                       help="Nobl9 API base URL (default: https://app.nobl9.com)")
+    parser.add_argument("--threshold", type=float, default=0.0,
+                       help="Minimum error budget percentage required (default: 0.0)")
+    parser.add_argument("--fields", 
+                       help="Additional fields to request (e.g., 'counts')")
+    parser.add_argument("--from", dest="from_time",
+                       help="Start time for data range (RFC3339 format)")
+    parser.add_argument("--to", dest="to_time",
+                       help="End time for data range (RFC3339 format)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Enable verbose output")
+    parser.add_argument("--json-output", action="store_true",
+                       help="Output SLO data as JSON")
+    
+    return parser.parse_args()
 
+def main():
+    """Main function"""
+    args = parse_arguments()
+    
+    try:
+        # Initialize Nobl9 client
+        nobl9 = Nobl9QualityGate(
+            organization=args.organization,
+            client_id=args.client_id,
+            client_secret=args.client_secret,
+            base_url=args.base_url
+        )
+        
+        if args.verbose:
+            print(f"Checking SLO: {args.slo_name}")
+            print(f"Project: {args.project}")
+            print(f"Organization: {args.organization}")
+            print(f"Threshold: {args.threshold}%")
+        
+        # Get SLO status
+        slo_data = nobl9.get_slo_status(
+            slo_name=args.slo_name,
+            project=args.project,
+            from_time=args.from_time,
+            to_time=args.to_time,
+            fields=args.fields
+        )
+        
+        # Output SLO data if requested
+        if args.json_output:
+            print(json.dumps(slo_data, indent=2))
+        
+        # Evaluate quality gate
+        pass_gate, error_budget_pct = nobl9.evaluate_quality_gate(
+            slo_data, args.threshold
+        )
+        
+        # Output results
+        print(f"Error budget remaining: {error_budget_pct:.2f}%")
+        print(f"Threshold: {args.threshold}%")
+        
+        if pass_gate:
+            print("✅ Quality gate PASSED - proceeding with release")
+            sys.exit(0)
+        else:
+            print("❌ Quality gate FAILED - canceling release")
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
-TOKEN = TOKEN.json()["access_token"]
-
-# SeriesEnum helper for providing predefined time series types.
-class SeriesEnum(str, Enum):
-    percentiles = "percentiles"
-    counts = "counts"
-    instantaneousBurnRate = "instantaneousBurnRate"
-    burnDown = "burnDown"
-
-    def __str__(self) -> str:
-        return self.value
-
-# SeriesPercentilesLevel helper for providing predefined percentiles levels.
-class SeriesPercentilesLevel(str, Enum):
-    p1 = "p1"
-    p5 = "p5"
-    p10 = "p10"
-    p50 = "p50"
-    p90 = "p90"
-    p95 = "p95"
-    p99 = "p99"
-
-    def __str__(self) -> str:
-        return self.value
-
-
-now = datetime.utcnow()
-since = now - timedelta(hours=3) # Last 3 hours.
-
-# RFC 3339 timestamp.
-# FROM = "2021-11-25T14:10:00.000Z"
-# TO = "2021-12-25T14:10:00.000Z"
-FROM = rfc3339.rfc3339(since)
-TO = rfc3339.rfc3339(now)
-
-STEPS = 20  # [1, 1000] - inclusive range - how many points to return for given time period (for series=percentiles IS TREATED ONLY AS A HINT).
-
-# Possible values for param
-# series=
-# - percentiles - for raw metrics (threshold), additional parameter - q possible values p1, p5, p10, p50, p90, p95, p99 e.g. q=p99 (when omitted all series are returned) - paremeter steps= treated only as hint returned number of points ma differ.
-# - counts      - for ratio type SLO (good & total are returned)
-# - instantaneousBurnRate
-# - burnDown
-SERIES = SeriesEnum.instantaneousBurnRate
-
-Q = SeriesPercentilesLevel.p95  # It's not taken into account if series is different than percentiles and when ommited all percentiles are returned.
-
-r = requests.get(
-    f"{URL}/api/timeseries/slo",
-    params={ # URL params
-        "name": SLO_NAME,
-        "from": FROM,
-        "to": TO,
-        "steps": STEPS,
-        "series": SERIES,
-        "q": Q, # Comment to ommit and get all percentiles for series percentiles.
-    },
-    headers={
-        "authorization": f"Bearer {TOKEN}",
-        "organization": ORGANIZATION,
-        "project": PROJECT,
-    },
-)
-
-# Use these to see what your output is
-#print(r.status_code)
-#print(r.url)
-#print(r.text)
-
-#Pretty Pint the JSON, put it in an object. 
-
-json_data = r.text
-json_object = json.loads(json_data)
-json_formatted_str = json.dumps(json_object, indent = 2)
-print(json_formatted_str)
-
-#check for errors
-error_budget_remaining_percentage = 0
-try:
-    error_budget_remaining_percentage = json_object[0]['timewindows'][0]['objectives'][0]['status']['errorBudgetRemainingPercentage']
-except KeyError as ke:
-    print('Data was not available from Nobl9 for this SLO; please check your SLO %s in project %s' % (SLO_NAME, PROJECT))
-    print(repr(ke))
-    print('proceed with release anyway')
-    sys.exit(0)
-except Exception as e:
-    print('Something has gone wrong fetching data from Nobl9')
-    print(repr(e))
-    print('proceed with release anyway')
-    sys.exit(0)
-
-#make a go, or no go decision. 
-
-pretty_eb = error_budget_remaining_percentage * 100
-print('Error budget remaining is %2.2f%%' % pretty_eb)
-if error_budget_remaining_percentage > 0:
-    print("prodeed with release")
-    sys.exit(0)
-else:
-    print("cancel release")
-    sys.exit(1)
+if __name__ == "__main__":
+    main()
