@@ -26,6 +26,10 @@ type ProcessingStats struct {
 	SkippedInvalidData   int
 	Failed               int
 	Errors               []string
+	// Detailed collections for better reporting
+	MissingUsers    []string
+	MissingProjects []string
+	AlreadyAssigned []string // formatted as user@domain -> project
 }
 
 // CSVRow represents a row from the CSV file
@@ -87,7 +91,8 @@ func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectNa
 	// In practice, you might need to implement this differently based on your specific requirements
 	// For now, we'll return false to allow the assignment to proceed
 
-	log.Printf("Checking existing role bindings for user %s in project %s with role %s", userID, projectName, role)
+    // Avoid logging internal user IDs
+    log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
 
 	// TODO: Implement actual role binding check if SDK supports it
 	// This would involve querying existing role bindings and checking if this specific
@@ -105,10 +110,11 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 	}
 
 	if user == nil {
-		return fmt.Errorf("user with email '%s' not found", userEmail)
+		return fmt.Errorf("user_not_found: user with email '%s' not found", userEmail)
 	}
 
-	log.Printf("Found user: %s (ID: %s)", userEmail, user.UserID)
+    // Avoid logging internal user IDs
+    log.Printf("Found user: %s", userEmail)
 
 	// Step 2: Check if user already has this role for this project
 	exists, err := checkExistingRoleBinding(ctx, client, projectName, user.UserID, role)
@@ -126,19 +132,37 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 		return nil
 	}
 
-	// Step 3: Generate a unique name for the role binding
+	// Step 3: Generate a unique name for the role binding (max 63 chars)
 	sanitizedProject := sanitizeName(projectName)
 	sanitizedEmail := sanitizeName(userEmail)
-	// Use nanosecond precision to avoid race conditions
-	roleBindingName := fmt.Sprintf("assign-%s-%s-%d", sanitizedProject, sanitizedEmail, time.Now().UnixNano())
+	// Create a shorter, unique identifier
+	timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // 8-char hex timestamp
+	baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+
+	// Truncate if too long (RFC-1123 limit is 63 characters)
+	roleBindingName := baseRole
+	if len(roleBindingName) > 63 {
+		// Keep project and timestamp, truncate email
+		maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
+		if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+			sanitizedEmail = sanitizedEmail[:maxEmailLen]
+		}
+		roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+	}
 
 	// Step 4: Create the role binding object
+	// Ensure project name is RFC-1123 compliant
+	sanitizedProjectRef := sanitizeName(projectName)
+	if sanitizedProjectRef != projectName {
+		log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
+	}
+
 	roleBinding := v1alphaRoleBinding.New(
 		v1alphaRoleBinding.Metadata{Name: roleBindingName},
 		v1alphaRoleBinding.Spec{
 			User:       ptr(user.UserID),
 			RoleRef:    role,
-			ProjectRef: projectName,
+			ProjectRef: sanitizedProjectRef,
 		},
 	)
 
@@ -267,23 +291,42 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 			continue
 		}
 
-		// Skip if user doesn't exist in Nobl9 (according to CSV)
-		if strings.ToUpper(row.UserExists) == "N" {
-			log.Printf("Skipping %s - user marked as not existing in Nobl9", row.UserEmail)
-			stats.SkippedUserNotExists++
-			continue
-		}
+		// Note: We now dynamically check if user exists instead of relying on CSV column
+		// The User Exists column is ignored in favor of real-time validation
 
 		// Attempt to assign role
 		err := assignProjectOwnerRole(ctx, client, row.AppShortName, row.UserEmail, role, dryRun)
 		if err != nil {
 			errorMsg := fmt.Sprintf("Row %d: %v", i+1, err)
 
-			// Check if it's an "already has role" error
+			// Check specific error types for better handling
 			if strings.Contains(err.Error(), "already has role") {
 				log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
 				stats.SkippedAlreadyOwner++
+				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+			} else if strings.Contains(err.Error(), "user_not_found:") {
+				// User doesn't exist in Nobl9 - gracefully skip
+				log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+				stats.SkippedUserNotExists++
+				stats.MissingUsers = append(stats.MissingUsers, row.UserEmail)
+			} else if strings.Contains(err.Error(), "Another RoleBinding") && strings.Contains(err.Error(), "already exists") {
+				// Duplicate role binding exists - treat as already assigned
+				log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
+				stats.SkippedAlreadyOwner++
+				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+			} else if strings.Contains(err.Error(), "Project") && strings.Contains(err.Error(), "not found") {
+				// Project doesn't exist in Nobl9
+				log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.AppShortName, row.UserEmail)
+				stats.SkippedInvalidData++
+				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.AppShortName))
+				stats.MissingProjects = append(stats.MissingProjects, row.AppShortName)
+			} else if strings.Contains(err.Error(), "Validation") {
+				// Validation errors (RFC-1123, length, etc.)
+				log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+				stats.SkippedInvalidData++
+				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Validation error - %s", i+1, err.Error()))
 			} else {
+				// Other errors (API issues, authentication, etc.)
 				log.Printf("Failed to assign role: %v", err)
 				stats.Failed++
 				stats.Errors = append(stats.Errors, errorMsg)
@@ -308,9 +351,9 @@ func printStats(stats *ProcessingStats) {
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("Total rows processed: %d\n", stats.TotalRows)
 	fmt.Printf("Successfully assigned: %d\n", stats.Assigned)
-	fmt.Printf("Skipped (already owner): %d\n", stats.SkippedAlreadyOwner)
+	fmt.Printf("Skipped (already assigned): %d\n", stats.SkippedAlreadyOwner)
 	fmt.Printf("Skipped (user not exists): %d\n", stats.SkippedUserNotExists)
-	fmt.Printf("Skipped (invalid data): %d\n", stats.SkippedInvalidData)
+	fmt.Printf("Skipped (invalid/missing projects): %d\n", stats.SkippedInvalidData)
 	fmt.Printf("Failed: %d\n", stats.Failed)
 
 	if len(stats.Errors) > 0 {
@@ -321,6 +364,51 @@ func printStats(stats *ProcessingStats) {
 				fmt.Printf("  ... and %d more errors\n", len(stats.Errors)-10)
 				break
 			}
+		}
+	}
+
+	// Helper to unique and sort small lists
+	uniqueSorted := func(items []string) []string {
+		if len(items) == 0 {
+			return items
+		}
+		m := make(map[string]struct{}, len(items))
+		out := make([]string, 0, len(items))
+		for _, it := range items {
+			if _, ok := m[it]; !ok {
+				m[it] = struct{}{}
+				out = append(out, it)
+			}
+		}
+		// simple insertion sort; lists are small
+		for i := 1; i < len(out); i++ {
+			j := i
+			for j > 0 && out[j-1] > out[j] {
+				out[j-1], out[j] = out[j], out[j-1]
+				j--
+			}
+		}
+		return out
+	}
+
+	if len(stats.MissingUsers) > 0 {
+		fmt.Printf("\nUsers not found in Nobl9 (%d):\n", len(stats.MissingUsers))
+		for _, u := range uniqueSorted(stats.MissingUsers) {
+			fmt.Printf("  - %s\n", u)
+		}
+	}
+
+	if len(stats.MissingProjects) > 0 {
+		fmt.Printf("\nProjects not found or invalid (%d):\n", len(stats.MissingProjects))
+		for _, p := range uniqueSorted(stats.MissingProjects) {
+			fmt.Printf("  - %s\n", p)
+		}
+	}
+
+	if len(stats.AlreadyAssigned) > 0 {
+		fmt.Printf("\nAlready assigned (unique user -> project pairs, %d):\n", len(stats.AlreadyAssigned))
+		for _, ap := range uniqueSorted(stats.AlreadyAssigned) {
+			fmt.Printf("  - %s\n", ap)
 		}
 	}
 }
@@ -355,7 +443,8 @@ func main() {
 		fmt.Println()
 		fmt.Println("CSV FORMAT:")
 		fmt.Println("  Required columns: 'App Short Name', 'User Email'")
-		fmt.Println("  Optional columns: 'User Exists' (Y/N)")
+		fmt.Println("  Optional columns: Any additional columns (will be ignored)")
+		fmt.Println("  Note: User existence is now checked dynamically against Nobl9 API")
 		fmt.Println()
 		fmt.Println("ENVIRONMENT VARIABLES:")
 		fmt.Println("  NOBL9_CLIENT_ID: Your Nobl9 API Client ID")

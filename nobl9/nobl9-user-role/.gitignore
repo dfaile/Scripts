@@ -6,9 +6,9 @@ logs/
 backups/
 *.backup
 
-# Binary files (optional - you might want to include these)
-# add-user-role
-# *.exe
+# Binary files
+add-user-role
+*.exe
 
 # Go build artifacts
 *.exe
