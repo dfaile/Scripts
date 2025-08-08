@@ -91,8 +91,8 @@ func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectNa
 	// In practice, you might need to implement this differently based on your specific requirements
 	// For now, we'll return false to allow the assignment to proceed
 
-    // Avoid logging internal user IDs
-    log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	// Avoid logging internal user IDs
+	log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
 
 	// TODO: Implement actual role binding check if SDK supports it
 	// This would involve querying existing role bindings and checking if this specific
@@ -113,8 +113,8 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 		return fmt.Errorf("user_not_found: user with email '%s' not found", userEmail)
 	}
 
-    // Avoid logging internal user IDs
-    log.Printf("Found user: %s", userEmail)
+	// Avoid logging internal user IDs
+	log.Printf("Found user: %s", userEmail)
 
 	// Step 2: Check if user already has this role for this project
 	exists, err := checkExistingRoleBinding(ctx, client, projectName, user.UserID, role)
