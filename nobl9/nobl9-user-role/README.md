@@ -576,9 +576,8 @@ Your CSV file must contain these columns (case-sensitive):
 **For Project-Level Roles:**
 ```csv
 App Short Name,Product Manager,User Exists,User Email,SLOs
-tiisaa,Akaniro Samuel Edozie,Y,samuel.akaniro@msd.com,https://app.nobl9.com/...
-msx,Anand Ruchika,Y,ruchika.anand@merck.com,
-bardscpi,Arnold Elizabeth F,Y,elizabeth_arnold2@merck.com,
+default,Some User,Y,some.user@somedomain.com,https://app.nobl9.com/...
+project_name,Another User,Y,another.user@merck.com,
 ```
 
 **For Organization-Level Roles:**
