@@ -63,7 +63,7 @@ OPTIONS:
     -h, --help              Show this help message
 
 VALID ROLES:
-    project-viewer, project-editor, project-admin, project-owner, organization-admin, viewe-status-page-manager
+    project-viewer, project-editor, project-admin, project-owner, organization-admin, viewer-status-page-manager
 
 ENVIRONMENT VARIABLES:
     NOBL9_CLIENT_ID         Nobl9 API Client ID (required)
