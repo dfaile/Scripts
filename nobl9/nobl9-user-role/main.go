@@ -43,12 +43,18 @@ type CSVRow struct {
 
 // Valid roles that can be assigned
 var validRoles = map[string]bool{
-	"project-viewer":     true,
-	"project-editor":     true,
-	"project-admin":      true,
-	"project-owner":      true,
-	"organization-admin": true,
-	"viewer-status-page-manager": true,
+	// Project-level roles
+	"project-viewer": true,
+	"project-editor": true,
+	"project-admin":  true,
+	"project-owner":  true,
+	// Organization-level roles (do not require a project)
+	"organization-admin":            true,
+	"organization-user":             true,
+	"organization-integrations-user": true,
+	"organization-responder":        true,
+	"organization-viewer":           true,
+	"viewer-status-page-manager":    true,
 }
 
 // ptr creates a pointer to a string, used for fields in the role binding spec
@@ -83,9 +89,21 @@ func getValidRoles() string {
 	return strings.Join(roles, ", ")
 }
 
-// checkExistingRoleBinding checks if user already has the specified role for the project
+// organizationRoleNames lists roles that are org-wide but don't use the "organization-" prefix
+var organizationRoleNames = map[string]bool{
+	"viewer-status-page-manager": true,
+}
+
+// isOrganizationRole checks if a role is an organization-level role
+func isOrganizationRole(role string) bool {
+	return strings.HasPrefix(role, "organization-") || organizationRoleNames[role]
+}
+
+// checkExistingRoleBinding checks if user already has the specified role
+// For project roles, checks within the project context
+// For organization roles, checks at organization level
 func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectName, userID, role string) (bool, error) {
-	// Get existing role bindings for the project
+	// Get existing role bindings
 	// This is a simplified check - in a production environment, you'd want more robust checking
 
 	// Note: The Nobl9 SDK doesn't appear to have a direct method to check existing role bindings
@@ -93,17 +111,30 @@ func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectNa
 	// For now, we'll return false to allow the assignment to proceed
 
 	// Avoid logging internal user IDs
-	log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	if isOrganizationRole(role) {
+		log.Printf("Checking existing organization role bindings with role %s", role)
+	} else {
+		log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	}
 
 	// TODO: Implement actual role binding check if SDK supports it
 	// This would involve querying existing role bindings and checking if this specific
-	// user-project-role combination already exists
+	// user-project-role (or user-role for org roles) combination already exists
 
 	return false, nil
 }
 
-// assignProjectOwnerRole assigns the specified role to a user for a project
-func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName, userEmail, role string, dryRun bool) error {
+// assignRole assigns the specified role to a user
+// For project-level roles, requires a project name
+// For organization-level roles, project name is optional and ignored
+func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail, role string, dryRun bool) error {
+	isOrgRole := isOrganizationRole(role)
+
+	// Validate: project-level roles require a project
+	if !isOrgRole && projectName == "" {
+		return fmt.Errorf("project-level role '%s' requires a project to be specified", role)
+	}
+
 	// Step 1: Check if the user exists by their email
 	user, err := client.Users().V2().GetUser(ctx, userEmail)
 	if err != nil {
@@ -117,7 +148,7 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 	// Avoid logging internal user IDs
 	log.Printf("Found user: %s", userEmail)
 
-	// Step 2: Check if user already has this role for this project
+	// Step 2: Check if user already has this role
 	exists, err := checkExistingRoleBinding(ctx, client, projectName, user.UserID, role)
 	if err != nil {
 		log.Printf("Warning: Could not check existing role bindings: %v", err)
@@ -125,54 +156,93 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 	}
 
 	if exists {
+		if isOrgRole {
+			return fmt.Errorf("user already has organization role '%s'", role)
+		}
 		return fmt.Errorf("user already has role '%s' for project '%s'", role, projectName)
 	}
 
 	if dryRun {
-		log.Printf("DRY RUN: Would assign role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+		if isOrgRole {
+			log.Printf("DRY RUN: Would assign organization role '%s' to user '%s'", role, userEmail)
+		} else {
+			log.Printf("DRY RUN: Would assign role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+		}
 		return nil
 	}
 
 	// Step 3: Generate a unique name for the role binding (max 63 chars)
-	sanitizedProject := sanitizeName(projectName)
 	sanitizedEmail := sanitizeName(userEmail)
-	// Create a shorter, unique identifier
 	timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // 8-char hex timestamp
-	baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
 
-	// Truncate if too long (RFC-1123 limit is 63 characters)
-	roleBindingName := baseRole
-	if len(roleBindingName) > 63 {
-		// Keep project and timestamp, truncate email
-		maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
-		if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
-			sanitizedEmail = sanitizedEmail[:maxEmailLen]
+	var roleBindingName string
+	if isOrgRole {
+		// For organization roles, use org- prefix instead of project
+		baseRole := fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
+		roleBindingName = baseRole
+		if len(roleBindingName) > 63 {
+			maxEmailLen := 63 - len(fmt.Sprintf("rb-org--%s", timestamp))
+			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+				sanitizedEmail = sanitizedEmail[:maxEmailLen]
+			}
+			roleBindingName = fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
 		}
-		roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+	} else {
+		// For project roles, include project name
+		sanitizedProject := sanitizeName(projectName)
+		baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+		roleBindingName = baseRole
+		if len(roleBindingName) > 63 {
+			// Keep project and timestamp, truncate email
+			maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
+			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+				sanitizedEmail = sanitizedEmail[:maxEmailLen]
+			}
+			roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+		}
 	}
 
 	// Step 4: Create the role binding object
-	// Ensure project name is RFC-1123 compliant
-	sanitizedProjectRef := sanitizeName(projectName)
-	if sanitizedProjectRef != projectName {
-		log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
-	}
+	var roleBinding v1alphaRoleBinding.RoleBinding
 
-	roleBinding := v1alphaRoleBinding.New(
-		v1alphaRoleBinding.Metadata{Name: roleBindingName},
-		v1alphaRoleBinding.Spec{
-			User:       ptr(user.UserID),
-			RoleRef:    role,
-			ProjectRef: sanitizedProjectRef,
-		},
-	)
+	if isOrgRole {
+		// Organization-level role binding: omit ProjectRef
+		roleBinding = v1alphaRoleBinding.New(
+			v1alphaRoleBinding.Metadata{Name: roleBindingName},
+			v1alphaRoleBinding.Spec{
+				User:    ptr(user.UserID),
+				RoleRef: role,
+				// ProjectRef is intentionally omitted for organization roles
+			},
+		)
+	} else {
+		// Project-level role binding: include ProjectRef
+		// Ensure project name is RFC-1123 compliant
+		sanitizedProjectRef := sanitizeName(projectName)
+		if sanitizedProjectRef != projectName {
+			log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
+		}
+
+		roleBinding = v1alphaRoleBinding.New(
+			v1alphaRoleBinding.Metadata{Name: roleBindingName},
+			v1alphaRoleBinding.Spec{
+				User:       ptr(user.UserID),
+				RoleRef:    role,
+				ProjectRef: sanitizedProjectRef,
+			},
+		)
+	}
 
 	// Step 5: Apply the role binding to assign the role
 	if err := client.Objects().V1().Apply(ctx, []manifest.Object{roleBinding}); err != nil {
 		return fmt.Errorf("failed to apply role binding: %v", err)
 	}
 
-	log.Printf("Successfully assigned role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+	if isOrgRole {
+		log.Printf("Successfully assigned organization role '%s' to user '%s'", role, userEmail)
+	} else {
+		log.Printf("Successfully assigned role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+	}
 	return nil
 }
 
@@ -261,15 +331,23 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 		log.Printf("DRY RUN MODE: No actual changes will be made")
 	}
 
+	// Check if role is organization-level
+	isOrgRole := isOrganizationRole(role)
+
 	// Process each row
 	for i, row := range rows {
 		stats.Processed++
 
-		log.Printf("Processing row %d: Project '%s', User '%s'", i+1, row.AppShortName, row.UserEmail)
+		if isOrgRole {
+			log.Printf("Processing row %d: Organization role, User '%s'", i+1, row.UserEmail)
+		} else {
+			log.Printf("Processing row %d: Project '%s', User '%s'", i+1, row.AppShortName, row.UserEmail)
+		}
 
 		// Validate row data
-		if row.AppShortName == "" {
-			err := fmt.Sprintf("Row %d: Empty project name", i+1)
+		// Project is required for project-level roles, optional for organization roles
+		if !isOrgRole && row.AppShortName == "" {
+			err := fmt.Sprintf("Row %d: Empty project name (required for project-level roles)", i+1)
 			log.Printf("Skipping - %s", err)
 			stats.SkippedInvalidData++
 			stats.Errors = append(stats.Errors, err)
@@ -296,34 +374,58 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 		// The User Exists column is ignored in favor of real-time validation
 
 		// Attempt to assign role
-		err := assignProjectOwnerRole(ctx, client, row.AppShortName, row.UserEmail, role, dryRun)
+		// For organization roles, project name is ignored
+		err := assignRole(ctx, client, row.AppShortName, row.UserEmail, role, dryRun)
 		if err != nil {
 			errorMsg := fmt.Sprintf("Row %d: %v", i+1, err)
 
 			// Check specific error types for better handling
-			if strings.Contains(err.Error(), "already has role") {
-				log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
+			if strings.Contains(err.Error(), "already has role") || strings.Contains(err.Error(), "already has organization role") {
+				if isOrgRole {
+					log.Printf("User '%s' already has organization role '%s' - skipping", row.UserEmail, role)
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
+				} else {
+					log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				}
 				stats.SkippedAlreadyOwner++
-				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
 			} else if strings.Contains(err.Error(), "user_not_found:") {
 				// User doesn't exist in Nobl9 - gracefully skip
-				log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+				if isOrgRole {
+					log.Printf("User '%s' not found in Nobl9 - skipping organization role assignment", row.UserEmail)
+				} else {
+					log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+				}
 				stats.SkippedUserNotExists++
 				stats.MissingUsers = append(stats.MissingUsers, row.UserEmail)
 			} else if strings.Contains(err.Error(), "Another RoleBinding") && strings.Contains(err.Error(), "already exists") {
 				// Duplicate role binding exists - treat as already assigned
-				log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
+				if isOrgRole {
+					log.Printf("User '%s' already has an organization role binding - skipping", row.UserEmail)
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
+				} else {
+					log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				}
 				stats.SkippedAlreadyOwner++
-				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
 			} else if strings.Contains(err.Error(), "Project") && strings.Contains(err.Error(), "not found") {
-				// Project doesn't exist in Nobl9
+				// Project doesn't exist in Nobl9 (only for project-level roles)
 				log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.AppShortName, row.UserEmail)
 				stats.SkippedInvalidData++
 				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.AppShortName))
 				stats.MissingProjects = append(stats.MissingProjects, row.AppShortName)
+			} else if strings.Contains(err.Error(), "requires a project") {
+				// Project-level role used without project
+				log.Printf("Row %d: Project-level role '%s' requires a project name", i+1, role)
+				stats.SkippedInvalidData++
+				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project required for role '%s'", i+1, role))
 			} else if strings.Contains(err.Error(), "Validation") {
 				// Validation errors (RFC-1123, length, etc.)
-				log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+				if isOrgRole {
+					log.Printf("Validation error for user '%s': %v", row.UserEmail, err)
+				} else {
+					log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+				}
 				stats.SkippedInvalidData++
 				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Validation error - %s", i+1, err.Error()))
 			} else {
@@ -417,7 +519,7 @@ func printStats(stats *ProcessingStats) {
 func main() {
 	// Define command-line flags
 	var (
-		projectFlag = flag.String("project", "", "Name of the project to add the user to (single user mode)")
+		projectFlag = flag.String("project", "", "Name of the project (required for project-level roles, optional for organization roles)")
 		emailFlag   = flag.String("email", "", "Email of the user to add (single user mode)")
 		roleFlag    = flag.String("role", "project-owner", "Role to assign to the user")
 		csvFlag     = flag.String("csv", "", "Path to CSV file for bulk processing")
@@ -431,10 +533,10 @@ func main() {
 		fmt.Println("Nobl9 User Role Manager")
 		fmt.Println("=======================")
 		fmt.Println()
-		fmt.Println("This tool assigns roles to users in Nobl9 projects.")
+		fmt.Println("This tool assigns roles to users in Nobl9 projects or at the organization level.")
 		fmt.Println()
 		fmt.Println("MODES:")
-		fmt.Println("  Single User Mode: Use --project, --email, and --role flags")
+		fmt.Println("  Single User Mode: Use --email and --role flags (--project optional for org roles)")
 		fmt.Println("  Bulk CSV Mode: Use --csv flag with optional --role")
 		fmt.Println()
 		fmt.Println("FLAGS:")
@@ -442,19 +544,25 @@ func main() {
 		fmt.Println()
 		fmt.Printf("Valid roles: %s\n", getValidRoles())
 		fmt.Println()
+		fmt.Println("ROLE TYPES:")
+		fmt.Println("  Project-level roles: Require --project flag (project-viewer, project-editor, etc.)")
+		fmt.Println("  Organization-level roles: Do not require --project flag (organization-admin, etc.)")
+		fmt.Println()
 		fmt.Println("CSV FORMAT:")
-		fmt.Println("  Required columns: 'App Short Name', 'User Email'")
-		fmt.Println("  Optional columns: Any additional columns (will be ignored)")
+		fmt.Println("  Required columns: 'User Email'")
+		fmt.Println("  Optional columns: 'App Short Name' (required for project-level roles)")
 		fmt.Println("  Note: User existence is now checked dynamically against Nobl9 API")
+		fmt.Println("  Note: For organization roles, 'App Short Name' column can be empty")
 		fmt.Println()
 		fmt.Println("ENVIRONMENT VARIABLES:")
 		fmt.Println("  NOBL9_CLIENT_ID: Your Nobl9 API Client ID")
 		fmt.Println("  NOBL9_CLIENT_SECRET: Your Nobl9 API Client Secret")
 		fmt.Println()
 		fmt.Println("EXAMPLES:")
-		fmt.Println("  Single user: ./add-user-role --project myproject --email user@example.com --role project-owner")
-		fmt.Println("  Bulk CSV:    ./add-user-role --csv projects.csv --role project-owner")
-		fmt.Println("  Dry run:     ./add-user-role --csv projects.csv --dry-run")
+		fmt.Println("  Project role:  ./add-user-role --project myproject --email user@example.com --role project-owner")
+		fmt.Println("  Org role:      ./add-user-role --email user@example.com --role organization-admin")
+		fmt.Println("  Bulk CSV:      ./add-user-role --csv projects.csv --role project-owner")
+		fmt.Println("  Dry run:       ./add-user-role --csv projects.csv --dry-run")
 		return
 	}
 
@@ -464,25 +572,33 @@ func main() {
 	}
 
 	// Determine mode: single user or bulk CSV
-	isSingleMode := *projectFlag != "" || *emailFlag != ""
+	isSingleMode := *emailFlag != ""
 	isBulkMode := *csvFlag != ""
 
 	if isSingleMode && isBulkMode {
-		log.Fatal("Error: Cannot use single user mode flags (--project, --email) with bulk mode flag (--csv)")
+		log.Fatal("Error: Cannot use single user mode flags (--email) with bulk mode flag (--csv)")
 	}
 
 	if !isSingleMode && !isBulkMode {
-		log.Fatal("Error: Must specify either single user mode (--project and --email) or bulk mode (--csv)")
+		log.Fatal("Error: Must specify either single user mode (--email) or bulk mode (--csv)")
 	}
+
+	// Check if role is organization-level
+	isOrgRole := isOrganizationRole(*roleFlag)
 
 	// Single user mode validation
 	if isSingleMode {
-		if *projectFlag == "" || *emailFlag == "" {
-			log.Fatal("Error: Both --project and --email are required for single user mode")
+		if *emailFlag == "" {
+			log.Fatal("Error: --email is required for single user mode")
 		}
 
 		if !validateEmail(*emailFlag) {
 			log.Fatal("Error: Invalid email format")
+		}
+
+		// Project is required for project-level roles, optional for organization roles
+		if !isOrgRole && *projectFlag == "" {
+			log.Fatalf("Error: --project is required for project-level role '%s'", *roleFlag)
 		}
 	}
 
@@ -514,14 +630,22 @@ func main() {
 	// Execute based on mode
 	if isSingleMode {
 		// Single user mode
-		log.Printf("Processing single user assignment: %s -> %s (%s)", *emailFlag, *projectFlag, *roleFlag)
+		if isOrgRole {
+			log.Printf("Processing single user assignment: %s (%s)", *emailFlag, *roleFlag)
+		} else {
+			log.Printf("Processing single user assignment: %s -> %s (%s)", *emailFlag, *projectFlag, *roleFlag)
+		}
 
-		err := assignProjectOwnerRole(ctx, client, *projectFlag, *emailFlag, *roleFlag, *dryRunFlag)
+		err := assignRole(ctx, client, *projectFlag, *emailFlag, *roleFlag, *dryRunFlag)
 		if err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 
-		fmt.Printf("Success: Assigned role '%s' to user '%s' in project '%s'\n", *roleFlag, *emailFlag, *projectFlag)
+		if isOrgRole {
+			fmt.Printf("Success: Assigned organization role '%s' to user '%s'\n", *roleFlag, *emailFlag)
+		} else {
+			fmt.Printf("Success: Assigned role '%s' to user '%s' in project '%s'\n", *roleFlag, *emailFlag, *projectFlag)
+		}
 	} else {
 		// Bulk CSV mode
 		log.Printf("Processing bulk assignment from CSV: %s (role: %s)", *csvFlag, *roleFlag)

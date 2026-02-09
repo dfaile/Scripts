@@ -92,7 +92,7 @@ You can use the Go binary directly for maximum control:
 
 | Flag | Description | Required |
 |------|-------------|----------|
-| `--project` | Project name (single user mode) | Yes (single mode) |
+| `--project` | Project name (required for project-level roles, optional for organization roles) | Yes (project roles) |
 | `--email` | User email (single user mode) | Yes (single mode) |
 | `--csv` | Path to CSV file (bulk mode) | Yes (bulk mode) |
 | `--role` | Role to assign | No (default: `project-owner`) |
@@ -101,12 +101,21 @@ You can use the Go binary directly for maximum control:
 
 ### Available Roles
 
+**Project-Level Roles** (require `--project`):
 - `project-viewer`: Read-only access to project resources
 - `project-editor`: Can edit project resources  
 - `project-admin`: Full administrative access to project
 - `project-owner`: Project ownership with user management rights
+
+**Organization-Level Roles** (do not require `--project`):
 - `organization-admin`: Organization-wide administrative access
-- `viewer-status-page-manager`: Status page manager access
+- `organization-user`: Standard user access at organization level
+- `organization-integrations-user`: Access for integrations and automation
+- `organization-responder`: Access to respond to alerts and incidents
+- `organization-viewer`: Read-only access at organization level
+- `viewer-status-page-manager`: Status page manager access (organization-wide)
+
+For more details on role permissions, see the [Nobl9 Organization Roles documentation](https://docs.nobl9.com/access-management/rbac/organization-roles/).
 
 ### Option 2: Wrapper Script Usage (Recommended)
 
@@ -128,7 +137,7 @@ For enhanced functionality with additional validation, logging, and user-friendl
 **Wrapper Script Options:**
 ```bash
 -c, --csv FILE          Path to CSV file for bulk processing
--p, --project PROJECT   Project name (single user mode)
+-p, --project PROJECT   Project name (required for project-level roles, optional for organization roles)
 -e, --email EMAIL       User email (single user mode)
 -r, --role ROLE         Role to assign (default: project-owner)
 -d, --dry-run           Perform dry run without making changes
@@ -144,8 +153,11 @@ For enhanced functionality with additional validation, logging, and user-friendl
 # Bulk assignment with validation and backup
 ./rolemanagerwrapper.sh --csv projects.csv --role project-owner --backup
 
-# Single user assignment with confirmation
+# Single user assignment with confirmation (project role)
 ./rolemanagerwrapper.sh --project myproject --email user@example.com --role project-editor
+
+# Single user assignment (organization role - no project needed)
+./rolemanagerwrapper.sh --email user@example.com --role organization-admin
 
 # Validate CSV format only
 ./rolemanagerwrapper.sh --csv projects.csv --validate-only
@@ -161,8 +173,9 @@ For enhanced functionality with additional validation, logging, and user-friendl
 
 ### 1. Single User Mode
 
-Assign a role to a single user:
+Assign a role to a single user. For project-level roles, you must specify `--project`. For organization-level roles, `--project` is not required.
 
+**Project-Level Role Example:**
 ```bash
 # Direct binary usage
 ./add-user-role --project "my-project" --email "user@example.com" --role "project-owner"
@@ -171,9 +184,22 @@ Assign a role to a single user:
 ./rolemanagerwrapper.sh --project "my-project" --email "user@example.com" --role "project-owner"
 ```
 
+**Organization-Level Role Example:**
+```bash
+# Direct binary usage (no project needed)
+./add-user-role --email "user@example.com" --role "organization-admin"
+
+# Wrapper script usage (recommended)
+./rolemanagerwrapper.sh --email "user@example.com" --role "organization-admin"
+```
+
 **Example Output:**
 ```
+# For project roles:
 Success: Assigned role 'project-owner' to user 'user@example.com' in project 'my-project'
+
+# For organization roles:
+Success: Assigned organization role 'organization-admin' to user 'user@example.com'
 ```
 
 ### 2. Bulk CSV Mode
@@ -477,6 +503,7 @@ Log files include:
 | `user not found` | User doesn't exist in Nobl9 | Check email, ensure user is invited |
 | `project not found` | Project doesn't exist | Verify project name and access |
 | `invalid role` | Role name is incorrect | Use one of the valid roles listed |
+| `requires a project` | Project-level role used without project | Add `--project` flag or ensure CSV has `App Short Name` |
 | `authentication failed` | Invalid credentials | Check CLIENT_ID and CLIENT_SECRET |
 
 ## Contributing
@@ -537,27 +564,36 @@ For issues and questions:
 
 Your CSV file must contain these columns (case-sensitive):
 
-- **`App Short Name`**: The name of the Nobl9 project
 - **`User Email`**: The email address of the user to assign the role to
 
 ### Optional Columns
 
-- **`User Exists`**: Y/N flag indicating if the user exists in Nobl9 (defaults to Y if not specified)
+- **`App Short Name`**: The name of the Nobl9 project (required for project-level roles, can be empty for organization-level roles)
+- **`User Exists`**: Y/N flag indicating if the user exists in Nobl9 (defaults to Y if not specified, but user existence is now checked dynamically)
 
 ### Example CSV Format
 
+**For Project-Level Roles:**
 ```csv
 App Short Name,Product Manager,User Exists,User Email,SLOs
 tiisaa,Akaniro Samuel Edozie,Y,samuel.akaniro@msd.com,https://app.nobl9.com/...
 msx,Anand Ruchika,Y,ruchika.anand@merck.com,
 bardscpi,Arnold Elizabeth F,Y,elizabeth_arnold2@merck.com,
-DARC,Arnold Elizabeth F,N,elizabeth_arnold2@merck.com,
+```
+
+**For Organization-Level Roles:**
+```csv
+App Short Name,User Email
+,admin@example.com
+,user@example.com
 ```
 
 **Notes:**
-- Rows with `User Exists = N` will be skipped automatically
-- Empty project names or email addresses will be skipped
+- For **project-level roles**: `App Short Name` is required and cannot be empty
+- For **organization-level roles**: `App Short Name` can be empty or omitted
+- Empty email addresses will be skipped
 - Invalid email formats will be rejected with detailed error messages
+- User existence is checked dynamically against the Nobl9 API (the `User Exists` column is informational only)
 
 ## Processing Results
 

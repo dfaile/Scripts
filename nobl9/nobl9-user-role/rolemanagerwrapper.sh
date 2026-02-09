@@ -52,7 +52,7 @@ DESCRIPTION:
 
 OPTIONS:
     -c, --csv FILE          Path to CSV file for bulk processing
-    -p, --project PROJECT   Project name (single user mode)
+    -p, --project PROJECT   Project name (required for project-level roles, optional for organization roles)
     -e, --email EMAIL       User email (single user mode)
     -r, --role ROLE         Role to assign (default: ${DEFAULT_ROLE})
     -d, --dry-run           Perform dry run without making changes
@@ -63,7 +63,8 @@ OPTIONS:
     -h, --help              Show this help message
 
 VALID ROLES:
-    project-viewer, project-editor, project-admin, project-owner, organization-admin, viewer-status-page-manager
+    Project-level: project-viewer, project-editor, project-admin, project-owner
+    Organization-level: organization-admin, organization-user, organization-integrations-user, organization-responder, organization-viewer, viewer-status-page-manager
 
 ENVIRONMENT VARIABLES:
     NOBL9_CLIENT_ID         Nobl9 API Client ID (required)
@@ -74,8 +75,11 @@ EXAMPLES:
     # Bulk assignment from CSV
     ${SCRIPT_NAME} --csv projects.csv --role project-owner
 
-    # Single user assignment
+    # Single user assignment (project role)
     ${SCRIPT_NAME} --project myproject --email user@example.com --role project-editor
+    
+    # Single user assignment (organization role - no project needed)
+    ${SCRIPT_NAME} --email user@example.com --role organization-admin
 
     # Dry run with verbose output
     ${SCRIPT_NAME} --csv projects.csv --dry-run --verbose
@@ -84,8 +88,9 @@ EXAMPLES:
     ${SCRIPT_NAME} --csv projects.csv --validate-only
 
 CSV FORMAT:
-    Required columns: 'App Short Name', 'User Email'
-    Optional columns: 'User Exists' (Y/N)
+    Required columns: 'User Email'
+    Optional columns: 'App Short Name' (required for project-level roles, can be empty for organization roles)
+    Note: For organization-level roles, 'App Short Name' column can be empty
 
 EOF
 }
@@ -382,16 +387,32 @@ parse_arguments() {
     # Set default role if not specified
     ROLE="${ROLE:-$DEFAULT_ROLE}"
     
+    # Check if role is organization-level (organization-* prefix or viewer-status-page-manager)
+    IS_ORG_ROLE=false
+    if [[ "${ROLE:-}" == organization-* || "${ROLE:-}" == "viewer-status-page-manager" ]]; then
+        IS_ORG_ROLE=true
+    fi
+    
     # Validate argument combinations
     if [[ -n "${CSV_FILE:-}" && (-n "${PROJECT:-}" || -n "${EMAIL:-}") ]]; then
         print_error "Cannot use --csv with --project or --email"
         exit 1
     fi
     
-    if [[ -z "${CSV_FILE:-}" && (-z "${PROJECT:-}" || -z "${EMAIL:-}") ]]; then
-        print_error "Must specify either --csv or both --project and --email"
-        usage
-        exit 1
+    # For single user mode: email is required, project is required only for project-level roles
+    if [[ -z "${CSV_FILE:-}" ]]; then
+        if [[ -z "${EMAIL:-}" ]]; then
+            print_error "Must specify --email for single user mode"
+            usage
+            exit 1
+        fi
+        
+        # Project is required for project-level roles
+        if [[ "$IS_ORG_ROLE" == "false" && -z "${PROJECT:-}" ]]; then
+            print_error "Must specify --project for project-level role '${ROLE:-}'"
+            usage
+            exit 1
+        fi
     fi
 }
 
@@ -446,10 +467,16 @@ main() {
         
     else
         # Single user mode
-        log "Processing in single user mode: $PROJECT -> $EMAIL ($ROLE)"
-        
-        if [[ "$DRY_RUN" != "true" ]]; then
-            confirm_action "You are about to assign role '$ROLE' to '$EMAIL' in project '$PROJECT'."
+        if [[ "${ROLE:-}" == organization-* ]]; then
+            log "Processing in single user mode (organization role): $EMAIL ($ROLE)"
+            if [[ "$DRY_RUN" != "true" ]]; then
+                confirm_action "You are about to assign organization role '$ROLE' to '$EMAIL'."
+            fi
+        else
+            log "Processing in single user mode: $PROJECT -> $EMAIL ($ROLE)"
+            if [[ "$DRY_RUN" != "true" ]]; then
+                confirm_action "You are about to assign role '$ROLE' to '$EMAIL' in project '$PROJECT'."
+            fi
         fi
     fi
     
