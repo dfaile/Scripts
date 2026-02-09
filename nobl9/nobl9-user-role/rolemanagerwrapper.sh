@@ -45,6 +45,7 @@ ${SCRIPT_NAME} - Nobl9 Role Assignment Wrapper Script
 USAGE:
     ${SCRIPT_NAME} [OPTIONS] --csv <csv-file>
     ${SCRIPT_NAME} [OPTIONS] --project <project> --email <email>
+    ${SCRIPT_NAME} [OPTIONS] --email <email> --role <organization-role>
 
 DESCRIPTION:
     A wrapper script for the Nobl9 role manager that provides additional
@@ -52,7 +53,7 @@ DESCRIPTION:
 
 OPTIONS:
     -c, --csv FILE          Path to CSV file for bulk processing
-    -p, --project PROJECT   Project name (single user mode)
+    -p, --project PROJECT   Project name (single user mode; required for project roles)
     -e, --email EMAIL       User email (single user mode)
     -r, --role ROLE         Role to assign (default: ${DEFAULT_ROLE})
     -d, --dry-run           Perform dry run without making changes
@@ -77,6 +78,9 @@ EXAMPLES:
     # Single user assignment
     ${SCRIPT_NAME} --project myproject --email user@example.com --role project-editor
 
+    # Organization-scoped role assignment (no project)
+    ${SCRIPT_NAME} --email user@example.com --role viewer-status-page-manager
+
     # Dry run with verbose output
     ${SCRIPT_NAME} --csv projects.csv --dry-run --verbose
 
@@ -84,7 +88,7 @@ EXAMPLES:
     ${SCRIPT_NAME} --csv projects.csv --validate-only
 
 CSV FORMAT:
-    Required columns: 'App Short Name', 'User Email'
+    Required columns: 'User Email' (and 'App Short Name' for project roles)
     Optional columns: 'User Exists' (Y/N)
 
 EOF
@@ -152,6 +156,17 @@ cleanup() {
 }
 
 # Validation functions
+is_org_role() {
+    case "$ROLE" in
+        organization-admin|viewer-status-page-manager)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 validate_environment() {
     log_debug "Validating environment variables"
     
@@ -215,14 +230,18 @@ validate_csv() {
     local header
     header=$(head -1 "$csv_file")
     
-    if [[ ! "$header" == *"App Short Name"* ]]; then
-        print_error "CSV file missing required column: 'App Short Name'"
-        return 1
-    fi
-    
     if [[ ! "$header" == *"User Email"* ]]; then
         print_error "CSV file missing required column: 'User Email'"
         return 1
+    fi
+
+    if [[ ! "$header" == *"App Short Name"* ]]; then
+        if is_org_role; then
+            print_warning "CSV missing 'App Short Name' (allowed for organization roles)"
+        else
+            print_error "CSV file missing required column: 'App Short Name'"
+            return 1
+        fi
     fi
     
     # Count rows (excluding header)
@@ -387,11 +406,23 @@ parse_arguments() {
         print_error "Cannot use --csv with --project or --email"
         exit 1
     fi
-    
-    if [[ -z "${CSV_FILE:-}" && (-z "${PROJECT:-}" || -z "${EMAIL:-}") ]]; then
-        print_error "Must specify either --csv or both --project and --email"
-        usage
-        exit 1
+
+    if [[ -z "${CSV_FILE:-}" ]]; then
+        if [[ -z "${EMAIL:-}" ]]; then
+            print_error "Must specify --email for single user mode"
+            usage
+            exit 1
+        fi
+
+        if ! is_org_role && [[ -z "${PROJECT:-}" ]]; then
+            print_error "Must specify --project for project-scoped roles"
+            usage
+            exit 1
+        fi
+
+        if is_org_role && [[ -n "${PROJECT:-}" ]]; then
+            print_warning "Role '$ROLE' is organization-scoped; --project will be ignored"
+        fi
     fi
 }
 

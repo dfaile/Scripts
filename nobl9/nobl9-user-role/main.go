@@ -29,7 +29,7 @@ type ProcessingStats struct {
 	// Detailed collections for better reporting
 	MissingUsers    []string
 	MissingProjects []string
-	AlreadyAssigned []string // formatted as user@domain -> project
+	AlreadyAssigned []string // formatted as user@domain -> target
 }
 
 // CSVRow represents a row from the CSV file
@@ -41,14 +41,22 @@ type CSVRow struct {
 	SLOs           string
 }
 
-// Valid roles that can be assigned
-var validRoles = map[string]bool{
-	"project-viewer":     true,
-	"project-editor":     true,
-	"project-admin":      true,
-	"project-owner":      true,
-	"organization-admin": true,
-	"viewer-status-page-manager": true,
+type RoleScope string
+
+const (
+	roleScopeProject      RoleScope = "project"
+	roleScopeOrganization RoleScope = "organization"
+)
+
+// roleScopes defines which roles are organization-scoped vs project-scoped.
+// Organization-scoped roles must not include ProjectRef in role bindings.
+var roleScopes = map[string]RoleScope{
+	"project-viewer":             roleScopeProject,
+	"project-editor":             roleScopeProject,
+	"project-admin":              roleScopeProject,
+	"project-owner":              roleScopeProject,
+	"organization-admin":         roleScopeOrganization,
+	"viewer-status-page-manager": roleScopeOrganization,
 }
 
 // ptr creates a pointer to a string, used for fields in the role binding spec
@@ -76,8 +84,8 @@ func validateEmail(email string) bool {
 
 // getValidRoles returns a formatted string of valid roles
 func getValidRoles() string {
-	roles := make([]string, 0, len(validRoles))
-	for role := range validRoles {
+	roles := make([]string, 0, len(roleScopes))
+	for role := range roleScopes {
 		roles = append(roles, role)
 	}
 	return strings.Join(roles, ", ")
@@ -93,7 +101,11 @@ func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectNa
 	// For now, we'll return false to allow the assignment to proceed
 
 	// Avoid logging internal user IDs
-	log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	if projectName == "" {
+		log.Printf("Checking existing role bindings at organization scope with role %s", role)
+	} else {
+		log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	}
 
 	// TODO: Implement actual role binding check if SDK supports it
 	// This would involve querying existing role bindings and checking if this specific
@@ -102,8 +114,12 @@ func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectNa
 	return false, nil
 }
 
-// assignProjectOwnerRole assigns the specified role to a user for a project
-func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName, userEmail, role string, dryRun bool) error {
+// assignRoleBinding assigns the specified role to a user for a project or the organization.
+func assignRoleBinding(ctx context.Context, client *sdk.Client, projectName, userEmail, role string, roleScope RoleScope, dryRun bool) error {
+	if roleScope == roleScopeProject && projectName == "" {
+		return fmt.Errorf("project name is required for project-scoped roles")
+	}
+
 	// Step 1: Check if the user exists by their email
 	user, err := client.Users().V2().GetUser(ctx, userEmail)
 	if err != nil {
@@ -125,46 +141,68 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 	}
 
 	if exists {
+		if roleScope == roleScopeOrganization {
+			return fmt.Errorf("user already has role '%s' at organization scope", role)
+		}
 		return fmt.Errorf("user already has role '%s' for project '%s'", role, projectName)
 	}
 
 	if dryRun {
-		log.Printf("DRY RUN: Would assign role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+		if roleScope == roleScopeOrganization {
+			log.Printf("DRY RUN: Would assign role '%s' to user '%s' at organization scope", role, userEmail)
+		} else {
+			log.Printf("DRY RUN: Would assign role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+		}
 		return nil
 	}
 
 	// Step 3: Generate a unique name for the role binding (max 63 chars)
-	sanitizedProject := sanitizeName(projectName)
 	sanitizedEmail := sanitizeName(userEmail)
 	// Create a shorter, unique identifier
 	timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // 8-char hex timestamp
-	baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
-
-	// Truncate if too long (RFC-1123 limit is 63 characters)
-	roleBindingName := baseRole
-	if len(roleBindingName) > 63 {
-		// Keep project and timestamp, truncate email
-		maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
-		if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
-			sanitizedEmail = sanitizedEmail[:maxEmailLen]
+	var roleBindingName string
+	if roleScope == roleScopeOrganization {
+		sanitizedRole := sanitizeName(role)
+		baseRole := fmt.Sprintf("rb-org-%s-%s-%s", sanitizedRole, sanitizedEmail, timestamp)
+		roleBindingName = baseRole
+		if len(roleBindingName) > 63 {
+			maxEmailLen := 63 - len(fmt.Sprintf("rb-org-%s--%s", sanitizedRole, timestamp))
+			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+				sanitizedEmail = sanitizedEmail[:maxEmailLen]
+			}
+			roleBindingName = fmt.Sprintf("rb-org-%s-%s-%s", sanitizedRole, sanitizedEmail, timestamp)
 		}
-		roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+	} else {
+		sanitizedProject := sanitizeName(projectName)
+		baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+		roleBindingName = baseRole
+		if len(roleBindingName) > 63 {
+			// Keep project and timestamp, truncate email
+			maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
+			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+				sanitizedEmail = sanitizedEmail[:maxEmailLen]
+			}
+			roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
+		}
 	}
 
 	// Step 4: Create the role binding object
-	// Ensure project name is RFC-1123 compliant
-	sanitizedProjectRef := sanitizeName(projectName)
-	if sanitizedProjectRef != projectName {
-		log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
+	spec := v1alphaRoleBinding.Spec{
+		User:    ptr(user.UserID),
+		RoleRef: role,
+	}
+	if roleScope == roleScopeProject {
+		// Ensure project name is RFC-1123 compliant
+		sanitizedProjectRef := sanitizeName(projectName)
+		if sanitizedProjectRef != projectName {
+			log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
+		}
+		spec.ProjectRef = sanitizedProjectRef
 	}
 
 	roleBinding := v1alphaRoleBinding.New(
 		v1alphaRoleBinding.Metadata{Name: roleBindingName},
-		v1alphaRoleBinding.Spec{
-			User:       ptr(user.UserID),
-			RoleRef:    role,
-			ProjectRef: sanitizedProjectRef,
-		},
+		spec,
 	)
 
 	// Step 5: Apply the role binding to assign the role
@@ -172,12 +210,16 @@ func assignProjectOwnerRole(ctx context.Context, client *sdk.Client, projectName
 		return fmt.Errorf("failed to apply role binding: %v", err)
 	}
 
-	log.Printf("Successfully assigned role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+	if roleScope == roleScopeOrganization {
+		log.Printf("Successfully assigned role '%s' to user '%s' at organization scope", role, userEmail)
+	} else {
+		log.Printf("Successfully assigned role '%s' to user '%s' in project '%s'", role, userEmail, projectName)
+	}
 	return nil
 }
 
 // parseCSVFile parses the CSV file and returns the data rows
-func parseCSVFile(filename string) ([]CSVRow, error) {
+func parseCSVFile(filename string, requireProject bool) ([]CSVRow, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open CSV file: %v", err)
@@ -210,8 +252,11 @@ func parseCSVFile(filename string) ([]CSVRow, error) {
 		}
 	}
 
-	if appNameIdx == -1 || userEmailIdx == -1 {
-		return nil, fmt.Errorf("CSV file must contain 'App Short Name' and 'User Email' columns")
+	if userEmailIdx == -1 {
+		return nil, fmt.Errorf("CSV file must contain 'User Email' column")
+	}
+	if requireProject && appNameIdx == -1 {
+		return nil, fmt.Errorf("CSV file must contain 'App Short Name' column for project-scoped roles")
 	}
 
 	// Parse data rows
@@ -227,8 +272,13 @@ func parseCSVFile(filename string) ([]CSVRow, error) {
 			userExists = strings.TrimSpace(record[userExistsIdx])
 		}
 
+		appName := ""
+		if appNameIdx != -1 && len(record) > appNameIdx {
+			appName = strings.TrimSpace(record[appNameIdx])
+		}
+
 		row := CSVRow{
-			AppShortName: strings.TrimSpace(record[appNameIdx]),
+			AppShortName: appName,
 			UserEmail:    strings.TrimSpace(record[userEmailIdx]),
 			UserExists:   userExists,
 		}
@@ -245,11 +295,12 @@ func parseCSVFile(filename string) ([]CSVRow, error) {
 }
 
 // processBulkAssignment processes the CSV file for bulk role assignments
-func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, role string, dryRun bool) (*ProcessingStats, error) {
+func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, role string, roleScope RoleScope, dryRun bool) (*ProcessingStats, error) {
 	stats := &ProcessingStats{}
 
 	// Parse CSV file
-	rows, err := parseCSVFile(filename)
+	requireProject := roleScope == roleScopeProject
+	rows, err := parseCSVFile(filename, requireProject)
 	if err != nil {
 		return stats, err
 	}
@@ -262,13 +313,21 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 	}
 
 	// Process each row
+	if roleScope == roleScopeOrganization {
+		log.Printf("Organization-scoped role detected; project values in CSV will be ignored")
+	}
+
 	for i, row := range rows {
 		stats.Processed++
 
-		log.Printf("Processing row %d: Project '%s', User '%s'", i+1, row.AppShortName, row.UserEmail)
+		targetLabel := "organization"
+		if roleScope == roleScopeProject {
+			targetLabel = fmt.Sprintf("project '%s'", row.AppShortName)
+		}
+		log.Printf("Processing row %d: %s, User '%s'", i+1, targetLabel, row.UserEmail)
 
 		// Validate row data
-		if row.AppShortName == "" {
+		if roleScope == roleScopeProject && row.AppShortName == "" {
 			err := fmt.Sprintf("Row %d: Empty project name", i+1)
 			log.Printf("Skipping - %s", err)
 			stats.SkippedInvalidData++
@@ -296,34 +355,68 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 		// The User Exists column is ignored in favor of real-time validation
 
 		// Attempt to assign role
-		err := assignProjectOwnerRole(ctx, client, row.AppShortName, row.UserEmail, role, dryRun)
+		projectName := row.AppShortName
+		if roleScope == roleScopeOrganization {
+			projectName = ""
+		}
+		err := assignRoleBinding(ctx, client, projectName, row.UserEmail, role, roleScope, dryRun)
 		if err != nil {
 			errorMsg := fmt.Sprintf("Row %d: %v", i+1, err)
 
 			// Check specific error types for better handling
 			if strings.Contains(err.Error(), "already has role") {
-				log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
+				if roleScope == roleScopeOrganization {
+					log.Printf("User '%s' already has role '%s' at organization scope - skipping", row.UserEmail, role)
+				} else {
+					log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
+				}
 				stats.SkippedAlreadyOwner++
-				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				if roleScope == roleScopeOrganization {
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
+				} else {
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				}
 			} else if strings.Contains(err.Error(), "user_not_found:") {
 				// User doesn't exist in Nobl9 - gracefully skip
-				log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+				if roleScope == roleScopeOrganization {
+					log.Printf("User '%s' not found in Nobl9 - skipping organization assignment", row.UserEmail)
+				} else {
+					log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+				}
 				stats.SkippedUserNotExists++
 				stats.MissingUsers = append(stats.MissingUsers, row.UserEmail)
 			} else if strings.Contains(err.Error(), "Another RoleBinding") && strings.Contains(err.Error(), "already exists") {
 				// Duplicate role binding exists - treat as already assigned
-				log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
+				if roleScope == roleScopeOrganization {
+					log.Printf("User '%s' already has an organization role binding - skipping", row.UserEmail)
+				} else {
+					log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
+				}
 				stats.SkippedAlreadyOwner++
-				stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				if roleScope == roleScopeOrganization {
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
+				} else {
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+				}
 			} else if strings.Contains(err.Error(), "Project") && strings.Contains(err.Error(), "not found") {
 				// Project doesn't exist in Nobl9
-				log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.AppShortName, row.UserEmail)
-				stats.SkippedInvalidData++
-				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.AppShortName))
-				stats.MissingProjects = append(stats.MissingProjects, row.AppShortName)
+				if roleScope == roleScopeProject {
+					log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.AppShortName, row.UserEmail)
+					stats.SkippedInvalidData++
+					stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.AppShortName))
+					stats.MissingProjects = append(stats.MissingProjects, row.AppShortName)
+				} else {
+					log.Printf("Unexpected project error for organization-scoped role: %v", err)
+					stats.Failed++
+					stats.Errors = append(stats.Errors, errorMsg)
+				}
 			} else if strings.Contains(err.Error(), "Validation") {
 				// Validation errors (RFC-1123, length, etc.)
-				log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+				if roleScope == roleScopeOrganization {
+					log.Printf("Validation error for organization role, user '%s': %v", row.UserEmail, err)
+				} else {
+					log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+				}
 				stats.SkippedInvalidData++
 				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Validation error - %s", i+1, err.Error()))
 			} else {
@@ -354,7 +447,7 @@ func printStats(stats *ProcessingStats) {
 	fmt.Printf("Successfully assigned: %d\n", stats.Assigned)
 	fmt.Printf("Skipped (already assigned): %d\n", stats.SkippedAlreadyOwner)
 	fmt.Printf("Skipped (user not exists): %d\n", stats.SkippedUserNotExists)
-	fmt.Printf("Skipped (invalid/missing projects): %d\n", stats.SkippedInvalidData)
+	fmt.Printf("Skipped (invalid data): %d\n", stats.SkippedInvalidData)
 	fmt.Printf("Failed: %d\n", stats.Failed)
 
 	if len(stats.Errors) > 0 {
@@ -407,7 +500,7 @@ func printStats(stats *ProcessingStats) {
 	}
 
 	if len(stats.AlreadyAssigned) > 0 {
-		fmt.Printf("\nAlready assigned (unique user -> project pairs, %d):\n", len(stats.AlreadyAssigned))
+		fmt.Printf("\nAlready assigned (unique user -> target pairs, %d):\n", len(stats.AlreadyAssigned))
 		for _, ap := range uniqueSorted(stats.AlreadyAssigned) {
 			fmt.Printf("  - %s\n", ap)
 		}
@@ -417,7 +510,7 @@ func printStats(stats *ProcessingStats) {
 func main() {
 	// Define command-line flags
 	var (
-		projectFlag = flag.String("project", "", "Name of the project to add the user to (single user mode)")
+		projectFlag = flag.String("project", "", "Name of the project to add the user to (single user mode; required for project roles)")
 		emailFlag   = flag.String("email", "", "Email of the user to add (single user mode)")
 		roleFlag    = flag.String("role", "project-owner", "Role to assign to the user")
 		csvFlag     = flag.String("csv", "", "Path to CSV file for bulk processing")
@@ -431,10 +524,10 @@ func main() {
 		fmt.Println("Nobl9 User Role Manager")
 		fmt.Println("=======================")
 		fmt.Println()
-		fmt.Println("This tool assigns roles to users in Nobl9 projects.")
+		fmt.Println("This tool assigns roles to users in Nobl9 projects or at organization scope.")
 		fmt.Println()
 		fmt.Println("MODES:")
-		fmt.Println("  Single User Mode: Use --project, --email, and --role flags")
+		fmt.Println("  Single User Mode: Use --email, optional --project, and --role flags")
 		fmt.Println("  Bulk CSV Mode: Use --csv flag with optional --role")
 		fmt.Println()
 		fmt.Println("FLAGS:")
@@ -443,7 +536,7 @@ func main() {
 		fmt.Printf("Valid roles: %s\n", getValidRoles())
 		fmt.Println()
 		fmt.Println("CSV FORMAT:")
-		fmt.Println("  Required columns: 'App Short Name', 'User Email'")
+		fmt.Println("  Required columns: 'User Email' (and 'App Short Name' for project roles)")
 		fmt.Println("  Optional columns: Any additional columns (will be ignored)")
 		fmt.Println("  Note: User existence is now checked dynamically against Nobl9 API")
 		fmt.Println()
@@ -452,14 +545,16 @@ func main() {
 		fmt.Println("  NOBL9_CLIENT_SECRET: Your Nobl9 API Client Secret")
 		fmt.Println()
 		fmt.Println("EXAMPLES:")
-		fmt.Println("  Single user: ./add-user-role --project myproject --email user@example.com --role project-owner")
-		fmt.Println("  Bulk CSV:    ./add-user-role --csv projects.csv --role project-owner")
-		fmt.Println("  Dry run:     ./add-user-role --csv projects.csv --dry-run")
+		fmt.Println("  Single user (project role): ./add-user-role --project myproject --email user@example.com --role project-owner")
+		fmt.Println("  Single user (org role):     ./add-user-role --email user@example.com --role viewer-status-page-manager")
+		fmt.Println("  Bulk CSV:                   ./add-user-role --csv projects.csv --role project-owner")
+		fmt.Println("  Dry run:                    ./add-user-role --csv projects.csv --dry-run")
 		return
 	}
 
 	// Validate role
-	if !validRoles[*roleFlag] {
+	roleScope, ok := roleScopes[*roleFlag]
+	if !ok {
 		log.Fatalf("Error: Invalid role '%s'. Must be one of: %v", *roleFlag, getValidRoles())
 	}
 
@@ -477,12 +572,16 @@ func main() {
 
 	// Single user mode validation
 	if isSingleMode {
-		if *projectFlag == "" || *emailFlag == "" {
-			log.Fatal("Error: Both --project and --email are required for single user mode")
+		if *emailFlag == "" {
+			log.Fatal("Error: --email is required for single user mode")
 		}
 
 		if !validateEmail(*emailFlag) {
 			log.Fatal("Error: Invalid email format")
+		}
+
+		if roleScope == roleScopeProject && *projectFlag == "" {
+			log.Fatal("Error: --project is required for project-scoped roles")
 		}
 	}
 
@@ -514,19 +613,32 @@ func main() {
 	// Execute based on mode
 	if isSingleMode {
 		// Single user mode
-		log.Printf("Processing single user assignment: %s -> %s (%s)", *emailFlag, *projectFlag, *roleFlag)
+		projectName := *projectFlag
+		if roleScope == roleScopeOrganization && projectName != "" {
+			log.Printf("Organization-scoped role '%s' ignores --project '%s'", *roleFlag, projectName)
+			projectName = ""
+		}
+		if roleScope == roleScopeOrganization {
+			log.Printf("Processing single user assignment at organization scope: %s (%s)", *emailFlag, *roleFlag)
+		} else {
+			log.Printf("Processing single user assignment: %s -> %s (%s)", *emailFlag, projectName, *roleFlag)
+		}
 
-		err := assignProjectOwnerRole(ctx, client, *projectFlag, *emailFlag, *roleFlag, *dryRunFlag)
+		err := assignRoleBinding(ctx, client, projectName, *emailFlag, *roleFlag, roleScope, *dryRunFlag)
 		if err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 
-		fmt.Printf("Success: Assigned role '%s' to user '%s' in project '%s'\n", *roleFlag, *emailFlag, *projectFlag)
+		if roleScope == roleScopeOrganization {
+			fmt.Printf("Success: Assigned role '%s' to user '%s' at organization scope\n", *roleFlag, *emailFlag)
+		} else {
+			fmt.Printf("Success: Assigned role '%s' to user '%s' in project '%s'\n", *roleFlag, *emailFlag, projectName)
+		}
 	} else {
 		// Bulk CSV mode
 		log.Printf("Processing bulk assignment from CSV: %s (role: %s)", *csvFlag, *roleFlag)
 
-		stats, err := processBulkAssignment(ctx, client, *csvFlag, *roleFlag, *dryRunFlag)
+		stats, err := processBulkAssignment(ctx, client, *csvFlag, *roleFlag, roleScope, *dryRunFlag)
 		if err != nil {
 			log.Fatalf("Error during bulk processing: %v", err)
 		}

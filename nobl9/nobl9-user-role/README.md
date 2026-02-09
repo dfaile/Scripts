@@ -92,7 +92,7 @@ You can use the Go binary directly for maximum control:
 
 | Flag | Description | Required |
 |------|-------------|----------|
-| `--project` | Project name (single user mode) | Yes (single mode) |
+| `--project` | Project name (single user mode) | Yes (project-scoped roles) |
 | `--email` | User email (single user mode) | Yes (single mode) |
 | `--csv` | Path to CSV file (bulk mode) | Yes (bulk mode) |
 | `--role` | Role to assign | No (default: `project-owner`) |
@@ -106,7 +106,10 @@ You can use the Go binary directly for maximum control:
 - `project-admin`: Full administrative access to project
 - `project-owner`: Project ownership with user management rights
 - `organization-admin`: Organization-wide administrative access
-- `viewer-status-page-manager`: Status page manager access
+- `viewer-status-page-manager`: Organization-level status page manager access
+
+**Organization-scoped roles:** `organization-admin`, `viewer-status-page-manager`  
+These roles do not require `--project`. If provided, project values are ignored.
 
 ### Option 2: Wrapper Script Usage (Recommended)
 
@@ -128,7 +131,7 @@ For enhanced functionality with additional validation, logging, and user-friendl
 **Wrapper Script Options:**
 ```bash
 -c, --csv FILE          Path to CSV file for bulk processing
--p, --project PROJECT   Project name (single user mode)
+-p, --project PROJECT   Project name (single user mode; required for project roles)
 -e, --email EMAIL       User email (single user mode)
 -r, --role ROLE         Role to assign (default: project-owner)
 -d, --dry-run           Perform dry run without making changes
@@ -166,6 +169,9 @@ Assign a role to a single user:
 ```bash
 # Direct binary usage
 ./add-user-role --project "my-project" --email "user@example.com" --role "project-owner"
+
+# Organization-scoped role (no project required)
+./add-user-role --email "user@example.com" --role "viewer-status-page-manager"
 
 # Wrapper script usage (recommended)
 ./rolemanagerwrapper.sh --project "my-project" --email "user@example.com" --role "project-owner"
@@ -537,8 +543,8 @@ For issues and questions:
 
 Your CSV file must contain these columns (case-sensitive):
 
-- **`App Short Name`**: The name of the Nobl9 project
 - **`User Email`**: The email address of the user to assign the role to
+- **`App Short Name`**: The name of the Nobl9 project (**required only for project-scoped roles**)
 
 ### Optional Columns
 
@@ -642,7 +648,7 @@ The tool automatically checks for existing role assignments to prevent duplicate
 
 #### 4. CSV Format Issues
 
-**Error:** `CSV file must contain 'App Short Name' and 'User Email' columns`
+**Error:** `CSV file must contain 'User Email' column` (and `App Short Name` for project roles)
 
 **Solutions:**
 - Ensure your CSV has the exact column headers (case-sensitive)
