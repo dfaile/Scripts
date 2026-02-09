@@ -14,6 +14,7 @@ import (
 	"github.com/nobl9/nobl9-go/manifest"
 	v1alphaRoleBinding "github.com/nobl9/nobl9-go/manifest/v1alpha/rolebinding"
 	"github.com/nobl9/nobl9-go/sdk"
+	objectsV1 "github.com/nobl9/nobl9-go/sdk/endpoints/objects/v1"
 )
 
 // ProcessingStats tracks the results of bulk processing
@@ -99,28 +100,42 @@ func isOrganizationRole(role string) bool {
 	return strings.HasPrefix(role, "organization-") || organizationRoleNames[role]
 }
 
-// checkExistingRoleBinding checks if user already has the specified role
-// For project roles, checks within the project context
-// For organization roles, checks at organization level
+// getExistingOrganizationRoleBinding returns the organization-level role binding for the user, if any.
+// Nobl9 creates a default org role binding per user; we must update it rather than create a new one.
+func getExistingOrganizationRoleBinding(ctx context.Context, client *sdk.Client, userID string) (*v1alphaRoleBinding.RoleBinding, error) {
+	all, err := client.Objects().V1().GetV1alphaRoleBindings(ctx, objectsV1.GetRoleBindingsRequest{Project: sdk.ProjectsWildcard})
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		rb := &all[i]
+		// Organization bindings have no project
+		if rb.Spec.ProjectRef != "" {
+			continue
+		}
+		if rb.Spec.User != nil && *rb.Spec.User == userID {
+			return rb, nil
+		}
+	}
+	return nil, nil
+}
+
+// checkExistingRoleBinding checks if user already has the specified role.
+// For organization roles, looks up the user's org-level binding and compares RoleRef.
 func checkExistingRoleBinding(ctx context.Context, client *sdk.Client, projectName, userID, role string) (bool, error) {
-	// Get existing role bindings
-	// This is a simplified check - in a production environment, you'd want more robust checking
-
-	// Note: The Nobl9 SDK doesn't appear to have a direct method to check existing role bindings
-	// In practice, you might need to implement this differently based on your specific requirements
-	// For now, we'll return false to allow the assignment to proceed
-
-	// Avoid logging internal user IDs
 	if isOrganizationRole(role) {
 		log.Printf("Checking existing organization role bindings with role %s", role)
-	} else {
-		log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+		existing, err := getExistingOrganizationRoleBinding(ctx, client, userID)
+		if err != nil {
+			return false, err
+		}
+		if existing != nil && existing.Spec.RoleRef == role {
+			return true, nil
+		}
+		return false, nil
 	}
-
-	// TODO: Implement actual role binding check if SDK supports it
-	// This would involve querying existing role bindings and checking if this specific
-	// user-project-role (or user-role for org roles) combination already exists
-
+	log.Printf("Checking existing role bindings in project %s with role %s", projectName, role)
+	// Project-level: no robust check implemented; allow assignment to proceed
 	return false, nil
 }
 
@@ -171,58 +186,62 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 		return nil
 	}
 
-	// Step 3: Generate a unique name for the role binding (max 63 chars)
-	sanitizedEmail := sanitizeName(userEmail)
-	timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // 8-char hex timestamp
+	var roleBinding v1alphaRoleBinding.RoleBinding
 
-	var roleBindingName string
 	if isOrgRole {
-		// For organization roles, use org- prefix instead of project
-		baseRole := fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
-		roleBindingName = baseRole
-		if len(roleBindingName) > 63 {
-			maxEmailLen := 63 - len(fmt.Sprintf("rb-org--%s", timestamp))
-			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
-				sanitizedEmail = sanitizedEmail[:maxEmailLen]
+		// Organization roles: Nobl9 allows only one org-level binding per user (e.g. default).
+		// Fetch existing binding and update its RoleRef instead of creating a new one.
+		existing, err := getExistingOrganizationRoleBinding(ctx, client, user.UserID)
+		if err != nil {
+			return fmt.Errorf("failed to get existing organization role binding: %v", err)
+		}
+		if existing != nil {
+			// Update existing binding to the new role (change default org role)
+			roleBinding = v1alphaRoleBinding.New(
+				v1alphaRoleBinding.Metadata{Name: existing.Metadata.Name},
+				v1alphaRoleBinding.Spec{
+					User:    ptr(user.UserID),
+					RoleRef: role,
+				},
+			)
+			log.Printf("Updating existing organization role binding '%s' from '%s' to '%s'", existing.Metadata.Name, existing.Spec.RoleRef, role)
+		} else {
+			// No existing org binding: create new one
+			sanitizedEmail := sanitizeName(userEmail)
+			timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8]
+			roleBindingName := fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
+			if len(roleBindingName) > 63 {
+				maxEmailLen := 63 - len(fmt.Sprintf("rb-org--%s", timestamp))
+				if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
+					sanitizedEmail = sanitizedEmail[:maxEmailLen]
+				}
+				roleBindingName = fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
 			}
-			roleBindingName = fmt.Sprintf("rb-org-%s-%s", sanitizedEmail, timestamp)
+			roleBinding = v1alphaRoleBinding.New(
+				v1alphaRoleBinding.Metadata{Name: roleBindingName},
+				v1alphaRoleBinding.Spec{
+					User:    ptr(user.UserID),
+					RoleRef: role,
+				},
+			)
 		}
 	} else {
-		// For project roles, include project name
+		// Project-level: generate unique name and create new binding
+		sanitizedEmail := sanitizeName(userEmail)
+		timestamp := fmt.Sprintf("%x", time.Now().UnixNano())[:8]
 		sanitizedProject := sanitizeName(projectName)
-		baseRole := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
-		roleBindingName = baseRole
+		roleBindingName := fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
 		if len(roleBindingName) > 63 {
-			// Keep project and timestamp, truncate email
 			maxEmailLen := 63 - len(fmt.Sprintf("rb-%s--%s", sanitizedProject, timestamp))
 			if maxEmailLen > 0 && len(sanitizedEmail) > maxEmailLen {
 				sanitizedEmail = sanitizedEmail[:maxEmailLen]
 			}
 			roleBindingName = fmt.Sprintf("rb-%s-%s-%s", sanitizedProject, sanitizedEmail, timestamp)
 		}
-	}
-
-	// Step 4: Create the role binding object
-	var roleBinding v1alphaRoleBinding.RoleBinding
-
-	if isOrgRole {
-		// Organization-level role binding: omit ProjectRef
-		roleBinding = v1alphaRoleBinding.New(
-			v1alphaRoleBinding.Metadata{Name: roleBindingName},
-			v1alphaRoleBinding.Spec{
-				User:    ptr(user.UserID),
-				RoleRef: role,
-				// ProjectRef is intentionally omitted for organization roles
-			},
-		)
-	} else {
-		// Project-level role binding: include ProjectRef
-		// Ensure project name is RFC-1123 compliant
 		sanitizedProjectRef := sanitizeName(projectName)
 		if sanitizedProjectRef != projectName {
 			log.Printf("Warning: Project name '%s' sanitized to '%s' for RFC-1123 compliance", projectName, sanitizedProjectRef)
 		}
-
 		roleBinding = v1alphaRoleBinding.New(
 			v1alphaRoleBinding.Metadata{Name: roleBindingName},
 			v1alphaRoleBinding.Spec{
@@ -233,7 +252,6 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 		)
 	}
 
-	// Step 5: Apply the role binding to assign the role
 	if err := client.Objects().V1().Apply(ctx, []manifest.Object{roleBinding}); err != nil {
 		return fmt.Errorf("failed to apply role binding: %v", err)
 	}
