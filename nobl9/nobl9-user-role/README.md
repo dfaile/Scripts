@@ -106,6 +106,7 @@ You can use the Go binary directly for maximum control:
 - `project-admin`: Full administrative access to project
 - `project-owner`: Project ownership with user management rights
 - `organization-admin`: Organization-wide administrative access
+- `viewe-status-page-manager`: Status page manager access
 
 ### Option 2: Wrapper Script Usage (Recommended)
 
