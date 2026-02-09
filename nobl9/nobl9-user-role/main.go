@@ -48,6 +48,7 @@ var validRoles = map[string]bool{
 	"project-admin":      true,
 	"project-owner":      true,
 	"organization-admin": true,
+	"viewer-status-page-manager": true,
 }
 
 // ptr creates a pointer to a string, used for fields in the role binding spec
