@@ -88,9 +88,8 @@ EXAMPLES:
     ${SCRIPT_NAME} --csv projects.csv --validate-only
 
 CSV FORMAT:
-    Required columns: 'User Email'
-    Optional columns: 'App Short Name' (required for project-level roles, can be empty for organization roles)
-    Note: For organization-level roles, 'App Short Name' column can be empty
+    Required columns: 'project-name', 'user email'
+    For organization-level roles, project-name can be empty
 
 EOF
 }
@@ -216,17 +215,17 @@ validate_csv() {
         return 1
     fi
     
-    # Validate CSV headers
+    # Validate CSV headers: only project-name and user email are required
     local header
     header=$(head -1 "$csv_file")
     
-    if [[ ! "$header" == *"App Short Name"* ]]; then
-        print_error "CSV file missing required column: 'App Short Name'"
+    if ! echo "$header" | grep -qi 'project-name\|project name'; then
+        print_error "CSV file missing required column: 'project-name'"
         return 1
     fi
     
-    if [[ ! "$header" == *"User Email"* ]]; then
-        print_error "CSV file missing required column: 'User Email'"
+    if ! echo "$header" | grep -qi 'user email'; then
+        print_error "CSV file missing required column: 'user email'"
         return 1
     fi
     

@@ -1,0 +1,8 @@
+# Nobl9 Project YAML - used by integration tests (name substituted at runtime).
+# See https://docs.nobl9.com/yaml-guide/#project
+apiVersion: n9/v1alpha
+kind: Project
+metadata:
+  name: PLACEHOLDER_PROJECT_NAME
+spec:
+  description: "Temporary project for nobl9-user-role integration tests"

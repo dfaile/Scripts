@@ -346,46 +346,61 @@ fi
 
 ## Testing
 
-### Unit Testing
+### Unit tests
 
-Create test CSV files:
-
-```csv
-App Short Name,User Exists,User Email
-test-project-1,Y,test1@example.com
-test-project-2,Y,test2@example.com
-test-project-3,N,nonexistent@example.com
-invalid-project,,invalid-email
-```
-
-### Integration Testing
+Unit tests require no credentials or external services:
 
 ```bash
-#!/bin/bash
-# Test script
-set -e
-
-echo "Running integration tests..."
-
-# Test 1: Dry run with valid CSV
-echo "Test 1: Dry run validation"
-./nobl9-role-manager --csv test-data.csv --dry-run
-
-# Test 2: Single user mode
-echo "Test 2: Single user assignment"
-./nobl9-role-manager --project test-project --email test@example.com --role project-viewer --dry-run
-
-# Test 3: Invalid role handling
-echo "Test 3: Invalid role rejection"
-if ./nobl9-role-manager --project test-project --email test@example.com --role invalid-role 2>/dev/null; then
-    echo "ERROR: Should have rejected invalid role"
-    exit 1
-else
-    echo "PASS: Invalid role properly rejected"
-fi
-
-echo "All tests passed!"
+go test -v ./...
 ```
+
+They cover CSV parsing, validation, sanitization, role checks, and output formatting.
+
+### Integration tests
+
+Integration tests create a real Nobl9 project (via `sloctl`), add a user to it, run a bulk CSV assignment, and change an organization role. They are behind the `integration` build tag and **skip** unless the required environment variables are set, so anyone can run the full suite and only integration tests are skipped when not configured.
+
+**Run unit + integration tests:**
+
+```bash
+go test -v -tags=integration ./...
+```
+
+**Environment variables for integration tests:**
+
+| Variable | Purpose | Example |
+|----------|---------|--------|
+| `NOBL9_TEST_CONTEXT` | sloctl context name (e.g. from `~/.config/nobl9/config.toml`) | `daniel` |
+| `NOBL9_TEST_USER_PROJECT` | User email to add to the temporary test project | `user@example.com` |
+| `NOBL9_TEST_USER_ORG` | User email whose organization role will be changed (left as set; not restored) | `admin@example.com` |
+| `SLOCTL_BIN` | Path to the `sloctl` binary (optional; default: `sloctl`) | `/usr/local/bin/sloctl` |
+
+Credentials for the binary (same as normal use) must also be set: `NOBL9_CLIENT_ID` and `NOBL9_CLIENT_SECRET`. They should match the chosen context so `sloctl` and the binary talk to the same Nobl9 organization.
+
+**Example (run integration tests with context and users):**
+
+```bash
+export NOBL9_CLIENT_ID="your_client_id"
+export NOBL9_CLIENT_SECRET="your_client_secret"
+export NOBL9_TEST_CONTEXT=daniel
+export NOBL9_TEST_USER_PROJECT=dfaile@nobl9.com
+export NOBL9_TEST_USER_ORG=alex@nobl9.com
+# Optional: export SLOCTL_BIN=/path/to/sloctl
+go test -v -tags=integration ./...
+```
+
+**Behavior:**
+
+- A **new project** is created with a unique name (`test-role-manager-<timestamp>`) and **deleted** at the end (cleanup runs even if a test fails).
+- The org-role user is **left** at the role set by the test (e.g. `organization-viewer`); no restore is performed.
+
+### CI (e.g. GitHub Actions)
+
+To run integration tests in CI:
+
+1. Install `sloctl` (e.g. download from [sloctl releases](https://github.com/nobl9/sloctl/releases)) or set `SLOCTL_BIN` to its path.
+2. Set secrets: `NOBL9_CLIENT_ID`, `NOBL9_CLIENT_SECRET`, and optionally `NOBL9_TEST_CONTEXT`, `NOBL9_TEST_USER_PROJECT`, `NOBL9_TEST_USER_ORG` (if not set, integration tests are skipped).
+3. Run: `go test -v -tags=integration ./...`
 
 ## Migration from Original Script
 
@@ -503,7 +518,7 @@ Log files include:
 | `user not found` | User doesn't exist in Nobl9 | Check email, ensure user is invited |
 | `project not found` | Project doesn't exist | Verify project name and access |
 | `invalid role` | Role name is incorrect | Use one of the valid roles listed |
-| `requires a project` | Project-level role used without project | Add `--project` flag or ensure CSV has `App Short Name` |
+| `requires a project` | Project-level role used without project | Add `--project` flag or ensure CSV has `Project Name` |
 | `authentication failed` | Invalid credentials | Check CLIENT_ID and CLIENT_SECRET |
 
 ## Contributing
@@ -562,34 +577,34 @@ For issues and questions:
 
 ### Required Columns
 
-Your CSV file must contain these columns (case-sensitive):
+Your CSV file must contain these columns (case-insensitive headers):
 
 - **`User Email`**: The email address of the user to assign the role to
+- **`Project Name`**: The Nobl9 project name (required for project-level roles, can be empty for organization-level roles). Legacy header `App Short Name` is also accepted.
 
 ### Optional Columns
 
-- **`App Short Name`**: The name of the Nobl9 project (required for project-level roles, can be empty for organization-level roles)
-- **`User Exists`**: Y/N flag indicating if the user exists in Nobl9 (defaults to Y if not specified, but user existence is now checked dynamically)
+- **`User Exists`**: Y/N flag (informational only; user existence is checked dynamically against the API)
 
 ### Example CSV Format
 
 **For Project-Level Roles:**
 ```csv
-App Short Name,Product Manager,User Exists,User Email,SLOs
-default,Some User,Y,some.user@somedomain.com,https://app.nobl9.com/...
-project_name,Another User,Y,another.user@merck.com,
+Project Name,User Exists,User Email
+default,Y,some.user@somedomain.com
+project_name,Y,another.user@example.com
 ```
 
 **For Organization-Level Roles:**
 ```csv
-App Short Name,User Email
+Project Name,User Email
 ,admin@example.com
 ,user@example.com
 ```
 
 **Notes:**
-- For **project-level roles**: `App Short Name` is required and cannot be empty
-- For **organization-level roles**: `App Short Name` can be empty or omitted
+- For **project-level roles**: `Project Name` is required and cannot be empty
+- For **organization-level roles**: `Project Name` can be empty or omitted
 - Empty email addresses will be skipped
 - Invalid email formats will be rejected with detailed error messages
 - User existence is checked dynamically against the Nobl9 API (the `User Exists` column is informational only)
@@ -677,10 +692,10 @@ The tool automatically checks for existing role assignments to prevent duplicate
 
 #### 4. CSV Format Issues
 
-**Error:** `CSV file must contain 'App Short Name' and 'User Email' columns`
+**Error:** `CSV file must contain 'Project Name' (or 'App Short Name') and 'User Email' columns`
 
 **Solutions:**
-- Ensure your CSV has the exact column headers (case-sensitive)
+- Ensure your CSV has column headers `Project Name` (or legacy `App Short Name`) and `User Email` (headers are case-insensitive)
 - Check for extra spaces in column headers
 - Verify the CSV file is properly formatted
 

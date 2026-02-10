@@ -3,18 +3,23 @@ package main
 import (
 	"context"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nobl9/nobl9-go/manifest"
 	v1alphaRoleBinding "github.com/nobl9/nobl9-go/manifest/v1alpha/rolebinding"
 	"github.com/nobl9/nobl9-go/sdk"
 	objectsV1 "github.com/nobl9/nobl9-go/sdk/endpoints/objects/v1"
+	usersV2 "github.com/nobl9/nobl9-go/sdk/endpoints/users/v2"
 )
 
 // ProcessingStats tracks the results of bulk processing
@@ -33,13 +38,10 @@ type ProcessingStats struct {
 	AlreadyAssigned []string // formatted as user@domain -> project
 }
 
-// CSVRow represents a row from the CSV file
+// CSVRow represents a row from the CSV file. Only project-name and user email are required.
 type CSVRow struct {
-	AppShortName   string
-	ProductManager string
-	UserExists     string
-	UserEmail      string
-	SLOs           string
+	ProjectName string
+	UserEmail   string
 }
 
 // Valid roles that can be assigned
@@ -57,6 +59,16 @@ var validRoles = map[string]bool{
 	"organization-viewer":           true,
 	"viewer-status-page-manager":    true,
 }
+
+// Sentinel errors for stable error classification (used with errors.Is).
+var (
+	ErrUserNotFound    = errors.New("user not found")
+	ErrAlreadyAssigned = errors.New("user already has this role")
+	ErrProjectNotFound = errors.New("project not found")
+	ErrRoleBindingExists = errors.New("role binding already exists")
+	ErrValidation      = errors.New("validation error")
+	ErrProjectRequired = errors.New("project required for project-level role")
+)
 
 // ptr creates a pointer to a string, used for fields in the role binding spec
 func ptr(s string) *string { return &s }
@@ -98,6 +110,56 @@ var organizationRoleNames = map[string]bool{
 // isOrganizationRole checks if a role is an organization-level role
 func isOrganizationRole(role string) bool {
 	return strings.HasPrefix(role, "organization-") || organizationRoleNames[role]
+}
+
+// isRetryable returns false for sentinel and context errors (do not retry).
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrUserNotFound) || errors.Is(err, ErrAlreadyAssigned) ||
+		errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrRoleBindingExists) ||
+		errors.Is(err, ErrValidation) || errors.Is(err, ErrProjectRequired) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
+const retryAttempts = 3
+const retryInitialDelay = 1 * time.Second
+
+// retryWithBackoff runs fn up to retryAttempts times with exponential backoff and jitter.
+// Stops on success, non-retryable error, or context cancellation.
+func retryWithBackoff(ctx context.Context, fn func() error) error {
+	var lastErr error
+	delay := retryInitialDelay
+	for attempt := 0; attempt < retryAttempts; attempt++ {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isRetryable(lastErr) {
+			return lastErr
+		}
+		if attempt == retryAttempts-1 {
+			return lastErr
+		}
+		// Jitter: 0.5 * delay to 1.5 * delay
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// advance backoff for next iteration
+			delay = time.Duration(float64(delay) * 1.5)
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+	}
+	return lastErr
 }
 
 // getExistingOrganizationRoleBinding returns the organization-level role binding for the user, if any.
@@ -147,17 +209,27 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 
 	// Validate: project-level roles require a project
 	if !isOrgRole && projectName == "" {
-		return fmt.Errorf("project-level role '%s' requires a project to be specified", role)
+		return fmt.Errorf("project-level role '%s' requires a project to be specified: %w", role, ErrProjectRequired)
 	}
 
-	// Step 1: Check if the user exists by their email
-	user, err := client.Users().V2().GetUser(ctx, userEmail)
+	// Step 1: Check if the user exists by their email (with retry for transient failures)
+	var user *usersV2.User
+	err := retryWithBackoff(ctx, func() error {
+		u, e := client.Users().V2().GetUser(ctx, userEmail)
+		if e != nil {
+			return e
+		}
+		if u == nil {
+			return ErrUserNotFound
+		}
+		user = u
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("error retrieving user from Nobl9 API: %v", err)
-	}
-
-	if user == nil {
-		return fmt.Errorf("user_not_found: user with email '%s' not found", userEmail)
+		if errors.Is(err, ErrUserNotFound) {
+			return fmt.Errorf("user with email '%s' not found: %w", userEmail, ErrUserNotFound)
+		}
+		return fmt.Errorf("error retrieving user from Nobl9 API: %w", err)
 	}
 
 	// Avoid logging internal user IDs
@@ -172,9 +244,9 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 
 	if exists {
 		if isOrgRole {
-			return fmt.Errorf("user already has organization role '%s'", role)
+			return fmt.Errorf("user already has organization role '%s': %w", role, ErrAlreadyAssigned)
 		}
-		return fmt.Errorf("user already has role '%s' for project '%s'", role, projectName)
+		return fmt.Errorf("user already has role '%s' for project '%s': %w", role, projectName, ErrAlreadyAssigned)
 	}
 
 	if dryRun {
@@ -193,7 +265,7 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 		// Fetch existing binding and update its RoleRef instead of creating a new one.
 		existing, err := getExistingOrganizationRoleBinding(ctx, client, user.UserID)
 		if err != nil {
-			return fmt.Errorf("failed to get existing organization role binding: %v", err)
+			return fmt.Errorf("failed to get existing organization role binding: %w", err)
 		}
 		if existing != nil {
 			// Update existing binding to the new role (change default org role)
@@ -252,8 +324,25 @@ func assignRole(ctx context.Context, client *sdk.Client, projectName, userEmail,
 		)
 	}
 
-	if err := client.Objects().V1().Apply(ctx, []manifest.Object{roleBinding}); err != nil {
-		return fmt.Errorf("failed to apply role binding: %v", err)
+	applyErr := retryWithBackoff(ctx, func() error {
+		err := client.Objects().V1().Apply(ctx, []manifest.Object{roleBinding})
+		if err != nil {
+			errStr := err.Error()
+			if strings.Contains(errStr, "Another RoleBinding") && strings.Contains(errStr, "already exists") {
+				return fmt.Errorf("failed to apply role binding: %w", ErrRoleBindingExists)
+			}
+			if strings.Contains(errStr, "Project") && strings.Contains(errStr, "not found") {
+				return fmt.Errorf("failed to apply role binding: %w", ErrProjectNotFound)
+			}
+			if strings.Contains(errStr, "Validation") {
+				return fmt.Errorf("failed to apply role binding: %w", ErrValidation)
+			}
+			return err
+		}
+		return nil
+	})
+	if applyErr != nil {
+		return applyErr
 	}
 
 	if isOrgRole {
@@ -282,47 +371,39 @@ func parseCSVFile(filename string) ([]CSVRow, error) {
 		return nil, fmt.Errorf("CSV file must have at least a header row and one data row")
 	}
 
-	// Find column indices
+	// Find column indices; only project-name and user email are required
 	header := records[0]
-	var appNameIdx, userEmailIdx, userExistsIdx = -1, -1, -1
+	var projectIdx, userEmailIdx = -1, -1
 
 	for i, col := range header {
 		colLower := strings.ToLower(strings.TrimSpace(col))
 		switch colLower {
-		case "app short name":
-			appNameIdx = i
+		case "project-name", "project name":
+			projectIdx = i
 		case "user email":
 			userEmailIdx = i
-		case "user exists":
-			userExistsIdx = i
 		}
 	}
 
-	if appNameIdx == -1 || userEmailIdx == -1 {
-		return nil, fmt.Errorf("CSV file must contain 'App Short Name' and 'User Email' columns")
+	if projectIdx == -1 || userEmailIdx == -1 {
+		return nil, fmt.Errorf("CSV file must contain 'project-name' and 'user email' columns")
 	}
 
 	// Parse data rows
 	var rows []CSVRow
 	for i, record := range records[1:] {
-		if len(record) <= appNameIdx || len(record) <= userEmailIdx {
+		if len(record) <= projectIdx || len(record) <= userEmailIdx {
 			log.Printf("Warning: Row %d has insufficient columns, skipping", i+2)
 			continue
 		}
 
-		userExists := "Y" // Default to Y if column doesn't exist
-		if userExistsIdx != -1 && len(record) > userExistsIdx {
-			userExists = strings.TrimSpace(record[userExistsIdx])
-		}
-
 		row := CSVRow{
-			AppShortName: strings.TrimSpace(record[appNameIdx]),
-			UserEmail:    strings.TrimSpace(record[userEmailIdx]),
-			UserExists:   userExists,
+			ProjectName: strings.TrimSpace(record[projectIdx]),
+			UserEmail:   strings.TrimSpace(record[userEmailIdx]),
 		}
 
 		// Skip empty rows
-		if row.AppShortName == "" && row.UserEmail == "" {
+		if row.ProjectName == "" && row.UserEmail == "" {
 			continue
 		}
 
@@ -332,8 +413,101 @@ func parseCSVFile(filename string) ([]CSVRow, error) {
 	return rows, nil
 }
 
-// processBulkAssignment processes the CSV file for bulk role assignments
-func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, role string, dryRun bool) (*ProcessingStats, error) {
+// validateCSVFile performs pre-flight checks: file exists, readable, non-empty.
+// Call before opening the CSV for bulk processing to fail fast.
+func validateCSVFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("CSV file does not exist: %s", path)
+		}
+		return fmt.Errorf("CSV file inaccessible: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("CSV path is a directory, not a file: %s", path)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("CSV file is empty: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("CSV file not readable: %w", err)
+	}
+	f.Close()
+	return nil
+}
+
+// getExistingProjectNames returns the set of project names that exist in Nobl9 (for pre-flight validation).
+func getExistingProjectNames(ctx context.Context, client *sdk.Client) (map[string]bool, error) {
+	projects, err := client.Objects().V1().GetV1alphaProjects(ctx, objectsV1.GetProjectsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(projects))
+	for i := range projects {
+		p := &projects[i]
+		name := p.Metadata.Name
+		out[name] = true
+		// Also allow sanitized form if it differs
+		if s := sanitizeName(name); s != name {
+			out[s] = true
+		}
+	}
+	return out, nil
+}
+
+// validateProjectsInCSV ensures every unique project name in the CSV exists in Nobl9.
+// Returns a list of missing project names, or nil if all exist.
+func validateProjectsInCSV(ctx context.Context, client *sdk.Client, filename string) (missing []string, err error) {
+	rows, err := parseCSVFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := getExistingProjectNames(ctx, client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+	seen := make(map[string]bool)
+	for _, row := range rows {
+		p := strings.TrimSpace(row.ProjectName)
+		if p == "" {
+			continue
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		sanitized := sanitizeName(p)
+		if !existing[p] && !existing[sanitized] {
+			missing = append(missing, p)
+		}
+	}
+	return missing, nil
+}
+
+// validateCSVRows validates all rows for structure (project when required, email format).
+// Used by --validate-only. Returns a list of validation errors and whether all rows are valid.
+func validateCSVRows(rows []CSVRow, isOrgRole bool) (invalid []string, valid bool) {
+	valid = true
+	for i, row := range rows {
+		if !isOrgRole && row.ProjectName == "" {
+			invalid = append(invalid, fmt.Sprintf("Row %d: empty project name (required for project-level roles)", i+1))
+			valid = false
+		}
+		if row.UserEmail == "" {
+			invalid = append(invalid, fmt.Sprintf("Row %d: empty user email", i+1))
+			valid = false
+		} else if !validateEmail(row.UserEmail) {
+			invalid = append(invalid, fmt.Sprintf("Row %d: invalid email format '%s'", i+1, row.UserEmail))
+			valid = false
+		}
+	}
+	return invalid, valid
+}
+
+// processBulkAssignment processes the CSV file for bulk role assignments.
+// delay is the pause between successful assignments (ignored in dry-run).
+func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, role string, dryRun bool, delay time.Duration) (*ProcessingStats, error) {
 	stats := &ProcessingStats{}
 
 	// Parse CSV file
@@ -354,17 +528,20 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 
 	// Process each row
 	for i, row := range rows {
+		if ctx.Err() != nil {
+			return stats, ctx.Err()
+		}
 		stats.Processed++
 
 		if isOrgRole {
 			log.Printf("Processing row %d: Organization role, User '%s'", i+1, row.UserEmail)
 		} else {
-			log.Printf("Processing row %d: Project '%s', User '%s'", i+1, row.AppShortName, row.UserEmail)
+			log.Printf("Processing row %d: Project '%s', User '%s'", i+1, row.ProjectName, row.UserEmail)
 		}
 
 		// Validate row data
 		// Project is required for project-level roles, optional for organization roles
-		if !isOrgRole && row.AppShortName == "" {
+		if !isOrgRole && row.ProjectName == "" {
 			err := fmt.Sprintf("Row %d: Empty project name (required for project-level roles)", i+1)
 			log.Printf("Skipping - %s", err)
 			stats.SkippedInvalidData++
@@ -388,66 +565,47 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 			continue
 		}
 
-		// Note: We now dynamically check if user exists instead of relying on CSV column
-		// The User Exists column is ignored in favor of real-time validation
-
-		// Attempt to assign role
-		// For organization roles, project name is ignored
-		err := assignRole(ctx, client, row.AppShortName, row.UserEmail, role, dryRun)
+		// Attempt to assign role (for organization roles, project name is ignored)
+		err := assignRole(ctx, client, row.ProjectName, row.UserEmail, role, dryRun)
 		if err != nil {
 			errorMsg := fmt.Sprintf("Row %d: %v", i+1, err)
 
-			// Check specific error types for better handling
-			if strings.Contains(err.Error(), "already has role") || strings.Contains(err.Error(), "already has organization role") {
+			switch {
+			case errors.Is(err, ErrAlreadyAssigned), errors.Is(err, ErrRoleBindingExists):
 				if isOrgRole {
 					log.Printf("User '%s' already has organization role '%s' - skipping", row.UserEmail, role)
 					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
 				} else {
-					log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.AppShortName)
-					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
+					log.Printf("User '%s' already has role '%s' for project '%s' - skipping", row.UserEmail, role, row.ProjectName)
+					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.ProjectName))
 				}
 				stats.SkippedAlreadyOwner++
-			} else if strings.Contains(err.Error(), "user_not_found:") {
-				// User doesn't exist in Nobl9 - gracefully skip
+			case errors.Is(err, ErrUserNotFound):
 				if isOrgRole {
 					log.Printf("User '%s' not found in Nobl9 - skipping organization role assignment", row.UserEmail)
 				} else {
-					log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.AppShortName)
+					log.Printf("User '%s' not found in Nobl9 - skipping assignment for project '%s'", row.UserEmail, row.ProjectName)
 				}
 				stats.SkippedUserNotExists++
 				stats.MissingUsers = append(stats.MissingUsers, row.UserEmail)
-			} else if strings.Contains(err.Error(), "Another RoleBinding") && strings.Contains(err.Error(), "already exists") {
-				// Duplicate role binding exists - treat as already assigned
-				if isOrgRole {
-					log.Printf("User '%s' already has an organization role binding - skipping", row.UserEmail)
-					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> organization", row.UserEmail))
-				} else {
-					log.Printf("User '%s' already has a role binding for project '%s' - skipping", row.UserEmail, row.AppShortName)
-					stats.AlreadyAssigned = append(stats.AlreadyAssigned, fmt.Sprintf("%s -> %s", row.UserEmail, row.AppShortName))
-				}
-				stats.SkippedAlreadyOwner++
-			} else if strings.Contains(err.Error(), "Project") && strings.Contains(err.Error(), "not found") {
-				// Project doesn't exist in Nobl9 (only for project-level roles)
-				log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.AppShortName, row.UserEmail)
+			case errors.Is(err, ErrProjectNotFound):
+				log.Printf("Project '%s' not found in Nobl9 - skipping assignment for user '%s'", row.ProjectName, row.UserEmail)
 				stats.SkippedInvalidData++
-				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.AppShortName))
-				stats.MissingProjects = append(stats.MissingProjects, row.AppShortName)
-			} else if strings.Contains(err.Error(), "requires a project") {
-				// Project-level role used without project
+				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project '%s' not found", i+1, row.ProjectName))
+				stats.MissingProjects = append(stats.MissingProjects, row.ProjectName)
+			case errors.Is(err, ErrProjectRequired):
 				log.Printf("Row %d: Project-level role '%s' requires a project name", i+1, role)
 				stats.SkippedInvalidData++
 				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Project required for role '%s'", i+1, role))
-			} else if strings.Contains(err.Error(), "Validation") {
-				// Validation errors (RFC-1123, length, etc.)
+			case errors.Is(err, ErrValidation):
 				if isOrgRole {
 					log.Printf("Validation error for user '%s': %v", row.UserEmail, err)
 				} else {
-					log.Printf("Validation error for project '%s', user '%s': %v", row.AppShortName, row.UserEmail, err)
+					log.Printf("Validation error for project '%s', user '%s': %v", row.ProjectName, row.UserEmail, err)
 				}
 				stats.SkippedInvalidData++
 				stats.Errors = append(stats.Errors, fmt.Sprintf("Row %d: Validation error - %s", i+1, err.Error()))
-			} else {
-				// Other errors (API issues, authentication, etc.)
+			default:
 				log.Printf("Failed to assign role: %v", err)
 				stats.Failed++
 				stats.Errors = append(stats.Errors, errorMsg)
@@ -455,9 +613,8 @@ func processBulkAssignment(ctx context.Context, client *sdk.Client, filename, ro
 		} else {
 			stats.Assigned++
 
-			// Add small delay to avoid overwhelming the API
-			if !dryRun {
-				time.Sleep(500 * time.Millisecond)
+			if !dryRun && delay > 0 {
+				time.Sleep(delay)
 			}
 		}
 	}
@@ -537,12 +694,18 @@ func printStats(stats *ProcessingStats) {
 func main() {
 	// Define command-line flags
 	var (
-		projectFlag = flag.String("project", "", "Name of the project (required for project-level roles, optional for organization roles)")
-		emailFlag   = flag.String("email", "", "Email of the user to add (single user mode)")
-		roleFlag    = flag.String("role", "project-owner", "Role to assign to the user")
-		csvFlag     = flag.String("csv", "", "Path to CSV file for bulk processing")
-		dryRunFlag  = flag.Bool("dry-run", false, "Perform a dry run without making actual changes")
-		helpFlag    = flag.Bool("help", false, "Show help message")
+		projectFlag       = flag.String("project", "", "Name of the project (required for project-level roles, optional for organization roles)")
+		emailFlag         = flag.String("email", "", "Email of the user to add (single user mode)")
+		roleFlag          = flag.String("role", "project-owner", "Role to assign to the user")
+		csvFlag           = flag.String("csv", "", "Path to CSV file for bulk processing")
+		dryRunFlag        = flag.Bool("dry-run", false, "Perform a dry run without making actual changes")
+		validateOnlyFlag  = flag.Bool("validate-only", false, "Only validate CSV structure and exit (use with --csv)")
+		timeoutFlag       = flag.Duration("timeout", 5*time.Minute, "Timeout for API operations")
+		delayFlag         = flag.Duration("delay", 500*time.Millisecond, "Delay between API calls in bulk mode")
+		logFileFlag       = flag.String("log-file", "", "Optional log file path (logs are also written to stderr)")
+		strictFlag        = flag.Bool("strict", false, "Exit with code 1 if any rows were skipped (e.g. missing user, invalid data)")
+		validateProjFlag  = flag.Bool("validate-projects", false, "In bulk project-level mode, validate all project names exist before applying")
+		helpFlag          = flag.Bool("help", false, "Show help message")
 	)
 	flag.Parse()
 
@@ -567,10 +730,8 @@ func main() {
 		fmt.Println("  Organization-level roles: Do not require --project flag (organization-admin, etc.)")
 		fmt.Println()
 		fmt.Println("CSV FORMAT:")
-		fmt.Println("  Required columns: 'User Email'")
-		fmt.Println("  Optional columns: 'App Short Name' (required for project-level roles)")
-		fmt.Println("  Note: User existence is now checked dynamically against Nobl9 API")
-		fmt.Println("  Note: For organization roles, 'App Short Name' column can be empty")
+		fmt.Println("  Required columns: 'project-name', 'user email'")
+		fmt.Println("  For organization roles, project-name can be empty")
 		fmt.Println()
 		fmt.Println("ENVIRONMENT VARIABLES:")
 		fmt.Println("  NOBL9_CLIENT_ID: Your Nobl9 API Client ID")
@@ -581,6 +742,8 @@ func main() {
 		fmt.Println("  Org role:      ./add-user-role --email user@example.com --role organization-admin")
 		fmt.Println("  Bulk CSV:      ./add-user-role --csv projects.csv --role project-owner")
 		fmt.Println("  Dry run:       ./add-user-role --csv projects.csv --dry-run")
+		fmt.Println("  Validate only: ./add-user-role --csv projects.csv --validate-only")
+		fmt.Println("  With options:  ./add-user-role --csv projects.csv --timeout 30m --delay 1s --log-file run.log")
 		return
 	}
 
@@ -599,6 +762,32 @@ func main() {
 
 	if !isSingleMode && !isBulkMode {
 		log.Fatal("Error: Must specify either single user mode (--email) or bulk mode (--csv)")
+	}
+
+	if *validateOnlyFlag && !isBulkMode {
+		log.Fatal("Error: --validate-only requires --csv")
+	}
+
+	// Validate-only mode: check CSV file and row structure, then exit (no API/client needed)
+	if *validateOnlyFlag {
+		if err := validateCSVFile(*csvFlag); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		rows, err := parseCSVFile(*csvFlag)
+		if err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		isOrgRole := isOrganizationRole(*roleFlag)
+		invalid, ok := validateCSVRows(rows, isOrgRole)
+		if ok {
+			fmt.Printf("Validation passed: %d rows valid\n", len(rows))
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Validation failed: %d error(s)\n", len(invalid))
+		for _, msg := range invalid {
+			fmt.Fprintf(os.Stderr, "  - %s\n", msg)
+		}
+		os.Exit(1)
 	}
 
 	// Check if role is organization-level
@@ -631,9 +820,32 @@ func main() {
 	os.Setenv("NOBL9_CLIENT_ID", clientID)
 	os.Setenv("NOBL9_CLIENT_SECRET", clientSecret)
 
-	// Initialize client with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Pre-flight: bulk mode CSV file must exist and be readable
+	if isBulkMode {
+		if err := validateCSVFile(*csvFlag); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+	}
+
+	// Optional log file: tee log output to file and stderr
+	if *logFileFlag != "" {
+		f, err := os.OpenFile(*logFileFlag, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Fatalf("Error: cannot open log file %s: %v", *logFileFlag, err)
+		}
+		defer f.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
+	}
+
+	// Context: timeout and signal cancellation
+	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
 	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
 
 	// Initialize the Nobl9 client
 	client, err := sdk.DefaultClient()
@@ -666,9 +878,24 @@ func main() {
 		}
 	} else {
 		// Bulk CSV mode
+		if *validateProjFlag && !isOrgRole {
+			missing, err := validateProjectsInCSV(ctx, client, *csvFlag)
+			if err != nil {
+				log.Fatalf("Error during project validation: %v", err)
+			}
+			if len(missing) > 0 {
+				log.Printf("The following projects from the CSV do not exist in Nobl9:")
+				for _, p := range missing {
+					log.Printf("  - %s", p)
+				}
+				os.Exit(1)
+			}
+			log.Printf("Pre-flight project validation passed")
+		}
+
 		log.Printf("Processing bulk assignment from CSV: %s (role: %s)", *csvFlag, *roleFlag)
 
-		stats, err := processBulkAssignment(ctx, client, *csvFlag, *roleFlag, *dryRunFlag)
+		stats, err := processBulkAssignment(ctx, client, *csvFlag, *roleFlag, *dryRunFlag, *delayFlag)
 		if err != nil {
 			log.Fatalf("Error during bulk processing: %v", err)
 		}
@@ -677,6 +904,10 @@ func main() {
 
 		// Exit with error code if there were failures
 		if stats.Failed > 0 {
+			os.Exit(1)
+		}
+		// Strict: exit 1 if any rows were skipped
+		if *strictFlag && (stats.SkippedAlreadyOwner > 0 || stats.SkippedUserNotExists > 0 || stats.SkippedInvalidData > 0) {
 			os.Exit(1)
 		}
 	}
