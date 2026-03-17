@@ -10,13 +10,12 @@ with best practices for production use:
 - Detailed logging and output
 - Command-line interface
 
-Features demonstrated:
+Features demonstrated (Mar 5 API: requestedBy required; no statusChange/statusChanges):
 1. Basic issue reporting
-2. Issue with status change
-3. Status change with propagation
-4. Component name verification
-5. Issue verification after creation
-6. Error handling and retries
+2. Component name verification
+3. Issue verification after creation
+4. Error handling and retries
+5. Optional url for source alert link
 
 This script can be used as-is or as a template for your own integrations.
 
@@ -86,57 +85,39 @@ class ExternalIssueReporter:
     def report_issue(
         self,
         component_name: str,
+        requested_by: str,
         comment: Optional[str] = None,
         occurred_at: Optional[str] = None,
-        requested_by: str = "external-system",
-        status: Optional[str] = None,
-        propagate_up: bool = False,
+        url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Report an external issue with retry logic.
+        Report an external issue (Mar 5 API: requestedBy required; no statusChange).
 
         Args:
             component_name: Name of the component (required)
+            requested_by: Requester identifier (required, 1-50 chars)
             comment: Description of the issue (optional)
-            occurred_at: ISO 8601 timestamp when issue occurred (optional, defaults to now)
-            requested_by: Identifier for the requester (default: "external-system")
-            status: Status to set (optional): operational, degradedPerformance, majorOutage
-            propagate_up: Propagate status change to parent components (default: False)
+            occurred_at: ISO 8601 timestamp (optional, default: now)
+            url: Optional link to source alert (uri, max 2048)
 
         Returns:
-            Response dictionary with 'reports' and optionally 'statusChanges'
-
-        Raises:
-            ValueError: If parameters are invalid
-            Exception: If request fails after all retries
+            Response dictionary with 'reports' and 'message' (no statusChanges in Mar 5 API)
         """
-        # Validate parameters
         if not component_name:
             raise ValueError("component_name is required")
+        if not requested_by or len(requested_by) > 50:
+            raise ValueError("requestedBy is required and must be 1-50 characters")
 
-        if status and status not in ["operational", "degradedPerformance", "majorOutage"]:
-            raise ValueError(
-                f"Invalid status '{status}'. Must be one of: "
-                "operational, degradedPerformance, majorOutage"
-            )
-
-        # Build payload
         payload = {
             "componentName": component_name,
-            "occurredAt": occurred_at or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            "requestedBy": requested_by,
+            "occurredAt": occurred_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "requestedBy": requested_by[:50],
         }
-
         if comment:
             payload["comment"] = comment
+        if url:
+            payload["url"] = url[:2048] if len(url) > 2048 else url
 
-        if status:
-            payload["statusChange"] = {
-                "status": status,
-                "propagateUp": propagate_up,
-            }
-
-        # Make request with retry logic
         return self._request_with_retry(payload)
 
     def _request_with_retry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -266,11 +247,18 @@ class ExternalIssueReporter:
             config = Config()
             client = StatusPageClient(config)
 
-            # List components
-            components = client.get("/status-page/components")
+            # List components (flatten nested tree)
+            resp = client.get("/status-page/components")
 
-            # Check if any component matches the name
-            matching = [c for c in components if c.get("name") == component_name]
+            def _flatten(components: list) -> list:
+                out = []
+                for c in components:
+                    out.append(c)
+                    if c.get("children"):
+                        out.extend(_flatten(c["children"]))
+                return out
+            flat = _flatten(resp.get("components") or [])
+            matching = [c for c in flat if c.get("name") == component_name]
             return len(matching) > 0
 
         except Exception as e:
@@ -309,8 +297,16 @@ class ExternalIssueReporter:
             config = Config()
             client = StatusPageClient(config)
 
-            # List components
-            return client.get("/status-page/components")
+            # List components (flatten nested tree to list)
+            def _flatten(components: list) -> list:
+                out = []
+                for c in components:
+                    out.append(c)
+                    if c.get("children"):
+                        out.extend(_flatten(c["children"]))
+                return out
+            resp = client.get("/status-page/components")
+            return _flatten(resp.get("components") or [])
 
         except Exception as e:
             raise Exception(f"Failed to list components: {e}")
@@ -354,16 +350,6 @@ def print_result(result: Dict[str, Any]):
         if report.get('comment'):
             print(f"    Comment:       {report.get('comment')}")
 
-    # Status changes
-    status_changes = result.get("statusChanges", [])
-    if status_changes:
-        print(f"\n✅ Triggered {len(status_changes)} status change(s):")
-        for i, change in enumerate(status_changes, 1):
-            print(f"\n  Status Change #{i}:")
-            print(f"    Component:     {change.get('componentName')}")
-            print(f"    Component ID:  {change.get('componentId')}")
-            print(f"    Status:        {change.get('previousStatus')} → {change.get('newStatus')}")
-
     # Message
     if result.get("message"):
         print(f"\n📝 {result.get('message')}")
@@ -386,11 +372,9 @@ Examples:
   # Simple issue report
   %(prog)s "API Service" --comment "High error rate detected"
 
-  # Issue with status change
-  %(prog)s "Database" --comment "Connection pool exhausted" --status degradedPerformance
-
-  # Issue with status propagation
-  %(prog)s "Auth Service" --status majorOutage --propagate --requested-by prometheus
+  # With custom requested-by and optional url
+  %(prog)s "Database" --comment "Connection pool exhausted" --requested-by prometheus
+  %(prog)s "Auth Service" --requested-by prometheus --url "https://grafana.example.com/alert/123"
 
   # List available components (requires NOBL9_CLIENT_ID and NOBL9_CLIENT_SECRET)
   %(prog)s --list-components
@@ -430,19 +414,11 @@ For detailed documentation, see: EXTERNAL_ISSUES_GUIDE.md
     parser.add_argument(
         "--requested-by",
         default="external-system",
-        help="Identifier for the requester (default: external-system)"
-    )
-
-    # Status change
-    parser.add_argument(
-        "--status",
-        choices=["operational", "degradedPerformance", "majorOutage"],
-        help="Status to set for the component"
+        help="Requester identifier (REQUIRED by API, 1-50 chars; default: external-system)"
     )
     parser.add_argument(
-        "--propagate",
-        action="store_true",
-        help="Propagate status change to parent components (requires --status)"
+        "--url",
+        help="Optional link to source alert (uri, max 2048 chars)"
     )
 
     # Verification and debugging
@@ -520,8 +496,9 @@ For detailed documentation, see: EXTERNAL_ISSUES_GUIDE.md
     if not args.component_name:
         parser.error("component_name is required (unless using --list-components)")
 
-    if args.propagate and not args.status:
-        parser.error("--propagate requires --status to be specified")
+    requested_by = (args.requested_by or "external-system").strip()
+    if not requested_by or len(requested_by) > 50:
+        parser.error("--requested-by must be 1-50 characters")
 
     # Display configuration
     print_banner("External Issue Reporting - Complete Example")
@@ -533,10 +510,9 @@ For detailed documentation, see: EXTERNAL_ISSUES_GUIDE.md
     print(f"   Component:        {args.component_name}")
     print(f"   Comment:          {args.comment or '(none)'}")
     print(f"   Occurred At:      {args.occurred_at or '(now)'}")
-    print(f"   Requested By:     {args.requested_by}")
-    if args.status:
-        print(f"   Status Change:    {args.status}")
-        print(f"   Propagate Up:     {args.propagate}")
+    print(f"   Requested By:     {requested_by}")
+    if getattr(args, "url", None):
+        print(f"   URL:              {args.url}")
 
     # Verify component exists (if requested)
     if args.verify:
@@ -553,25 +529,18 @@ For detailed documentation, see: EXTERNAL_ISSUES_GUIDE.md
     try:
         result = reporter.report_issue(
             component_name=args.component_name,
+            requested_by=requested_by,
             comment=args.comment,
             occurred_at=args.occurred_at,
-            requested_by=args.requested_by,
-            status=args.status,
-            propagate_up=args.propagate,
+            url=getattr(args, "url", None),
         )
 
-        # Print result
         print_result(result)
 
-        # Success message
         print_banner("✅ Issue Reported Successfully")
         print("\nNext Steps:")
         print("  1. Check your status page to see the issue")
         print("  2. View the issue details in the Nobl9 UI")
-        if args.status:
-            print("  3. Verify the status change took effect")
-        if args.propagate:
-            print("  4. Check parent components for propagated status")
 
     except ValueError as e:
         print(f"\n❌ Validation Error: {e}", file=sys.stderr)

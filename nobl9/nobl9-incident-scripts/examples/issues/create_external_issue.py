@@ -1,69 +1,21 @@
 #!/usr/bin/env python3
-"""Create an external issue report.
+"""Create an external issue report (Mar 5 API).
 
 IMPORTANT: Despite the name "external", this endpoint REQUIRES authentication.
 
-This script creates issue reports from external monitoring systems. Features:
-- Requires authentication (NOBL9_CLIENT_ID and NOBL9_CLIENT_SECRET)
-- Matches components by name (may create multiple reports if names match)
-- Optionally triggers status change
-- Custom requestedBy identifier
-- Component verification (with --verify)
-- Issue verification after creation
-- Retry logic (with --retry)
-
-This endpoint is designed for integration with external monitoring tools like
-Prometheus, Datadog, or custom alerting systems.
+Mar 5 API: requestedBy is REQUIRED (1-50 chars). statusChange/statusChanges removed.
+To change component status, create an incident separately (POST /status-page/incidents).
 
 Usage:
     python create_external_issue.py <component_name> [options]
 
-Arguments:
-    component_name: Name of the component (matches any component with this name)
-
 Options:
-    --comment TEXT: Description of the issue
-    --occurred-at TIMESTAMP: When the issue occurred (ISO 8601, defaults to now)
-    --requested-by ID: Identifier for the system making the request (default: "external-system")
-    --status STATUS: Trigger status change (operational, degradedPerformance, majorOutage)
-    --propagate: Propagate status change to parent components (requires --status)
-    --verify: Verify component exists before creating issue (requires NOBL9_CLIENT_ID and NOBL9_CLIENT_SECRET)
-    --list-components: List all available components (requires NOBL9_CLIENT_ID and NOBL9_CLIENT_SECRET)
-    --retry: Enable retry logic with exponential backoff (3 attempts)
+    --comment TEXT, --occurred-at TIMESTAMP, --requested-by ID (required, 1-50 chars),
+    --url URL (optional, uri max 2048), --verify, --list-components, --retry.
 
 Examples:
-    # Simple external issue report
-    python create_external_issue.py "API Service" --comment "High error rate"
-
-    # Report with status change
-    python create_external_issue.py "API Service" \\
-        --comment "Critical failure" \\
-        --status majorOutage \\
-        --requested-by prometheus-alertmanager
-
-    # Report with propagation
-    python create_external_issue.py "Database" \\
-        --status degradedPerformance \\
-        --propagate \\
-        --requested-by datadog
-
-    # Verify component before reporting
-    python create_external_issue.py "API Service" --comment "Test" --verify
-
-    # List available components
-    python create_external_issue.py --list-components
-
-Environment Variables:
-    NOBL9_ORG: Your organization ID (required)
-    NOBL9_CLIENT_ID: Client ID (required)
-    NOBL9_CLIENT_SECRET: Client secret (required)
-    NOBL9_BASE_URL: API base URL (optional)
-
-Note: Authentication is REQUIRED for this endpoint. The script automatically handles
-token generation and base64 encoding from your client credentials.
-
-For comprehensive documentation, see: EXTERNAL_ISSUES_GUIDE.md
-For a production-ready example, see: external_issue_complete_example.py
+    python create_external_issue.py "API Service" --comment "High error rate" --requested-by prometheus
+    python create_external_issue.py "API Service" --requested-by datadog --url "https://grafana.example.com/alert/123"
 """
 import sys
 from pathlib import Path
@@ -77,72 +29,48 @@ from examples.common import get_config, StatusPageClient, pretty_print, APIError
 def create_external_issue(
     client: StatusPageClient,
     component_name: str,
+    requested_by: str,
     comment: str = None,
     occurred_at: str = None,
-    requested_by: str = None,
-    status: str = None,
-    propagate_up: bool = False,
+    url: str = None,
 ) -> dict:
-    """Create an external issue report.
+    """Create an external issue report (Mar 5 API: requestedBy required; no statusChange).
 
     Args:
         client: StatusPageClient instance.
         component_name: Name of the component.
+        requested_by: Requester identifier (required, 1-50 chars).
         comment: Optional issue description.
         occurred_at: Optional timestamp (ISO 8601).
-        requested_by: Optional identifier for requester.
-        status: Optional status to set.
-        propagate_up: Whether to propagate status change.
+        url: Optional link to source alert (uri, max 2048).
 
     Returns:
-        External issue result.
+        External issue result (reports, message). No statusChanges in Mar 5 API.
     """
+    if not requested_by or len(requested_by) > 50:
+        raise ValueError("requestedBy is required and must be 1-50 characters")
     payload = {
         "componentName": component_name,
-        "occurredAt": occurred_at or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        "occurredAt": occurred_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "requestedBy": requested_by[:50],
     }
     if comment:
         payload["comment"] = comment
-    if requested_by:
-        payload["requestedBy"] = requested_by
-    if status:
-        payload["statusChange"] = {
-            "status": status,
-            "propagateUp": propagate_up,
-        }
-
-    # Note: External endpoint requires Basic auth (not Bearer token)
+    if url:
+        payload["url"] = url[:2048] if len(url) > 2048 else url
     return client.post_external("/status-page/issues/external", payload)
 
 
 def create_external_issue_with_retry(
     client: StatusPageClient,
     component_name: str,
+    requested_by: str,
     comment: str = None,
     occurred_at: str = None,
-    requested_by: str = None,
-    status: str = None,
-    propagate_up: bool = False,
+    url: str = None,
     max_retries: int = 3,
 ) -> dict:
-    """Create an external issue report with retry logic.
-
-    Args:
-        client: StatusPageClient instance.
-        component_name: Name of the component.
-        comment: Optional issue description.
-        occurred_at: Optional timestamp (ISO 8601).
-        requested_by: Optional identifier for requester.
-        status: Optional status to set.
-        propagate_up: Whether to propagate status change.
-        max_retries: Maximum number of retry attempts.
-
-    Returns:
-        External issue result.
-
-    Raises:
-        APIError: If all retries fail.
-    """
+    """Create an external issue report with retry logic (Mar 5: requestedBy required)."""
     backoff = 1.0
     last_error = None
 
@@ -151,11 +79,10 @@ def create_external_issue_with_retry(
             return create_external_issue(
                 client,
                 component_name,
-                comment,
-                occurred_at,
                 requested_by,
-                status,
-                propagate_up,
+                comment=comment,
+                occurred_at=occurred_at,
+                url=url,
             )
         except RateLimitError as e:
             last_error = e
@@ -247,18 +174,9 @@ def main():
     parser.add_argument(
         "--requested-by",
         default="external-system",
-        help="Identifier for the requester (default: external-system)",
+        help="Requester identifier (REQUIRED by API, 1-50 chars; default: external-system)",
     )
-    parser.add_argument(
-        "--status",
-        choices=["operational", "degradedPerformance", "majorOutage"],
-        help="Trigger status change",
-    )
-    parser.add_argument(
-        "--propagate",
-        action="store_true",
-        help="Propagate status change to parents (requires --status)",
-    )
+    parser.add_argument("--url", help="Optional link to source alert (uri, max 2048 chars)")
     parser.add_argument(
         "--verify",
         action="store_true",
@@ -280,7 +198,7 @@ def main():
     # Handle --list-components
     if args.list_components:
         try:
-            from common.config import Config
+            from examples.common.config import Config
             config = Config()
             if not config.organization:
                 raise ValueError("NOBL9_ORG environment variable is required")
@@ -323,12 +241,11 @@ def main():
             print(f"❌ Configuration Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Validate required arguments
     if not args.component_name:
         parser.error("component_name is required (unless using --list-components)")
-
-    if args.propagate and not args.status:
-        parser.error("--propagate requires --status to be specified")
+    requested_by = (args.requested_by or "external-system").strip()
+    if not requested_by or len(requested_by) > 50:
+        parser.error("--requested-by must be 1-50 characters")
 
     try:
         # Note: Despite the endpoint name "external", it DOES require authentication
@@ -351,31 +268,24 @@ def main():
                     sys.exit(1)
 
         print(f"Creating external issue report for component '{args.component_name}'...")
-        if args.status:
-            print(f"Will change status to: {args.status}")
-            if args.propagate:
-                print("Status change will propagate to parent components.")
 
-        # Create issue (with or without retry)
         if args.retry:
             result = create_external_issue_with_retry(
                 client,
                 args.component_name,
-                args.comment,
-                args.occurred_at,
-                args.requested_by,
-                args.status,
-                args.propagate,
+                requested_by,
+                comment=args.comment,
+                occurred_at=args.occurred_at,
+                url=args.url,
             )
         else:
             result = create_external_issue(
                 client,
                 args.component_name,
-                args.comment,
-                args.occurred_at,
-                args.requested_by,
-                args.status,
-                args.propagate,
+                requested_by,
+                comment=args.comment,
+                occurred_at=args.occurred_at,
+                url=args.url,
             )
 
         print("\nExternal Issue Result:")
@@ -387,13 +297,6 @@ def main():
         for report in reports:
             print(f"   - Issue ID: {report.get('id')}")
             print(f"     Component: {report.get('componentName')} ({report.get('componentId')})")
-
-        if result.get("statusChanges"):
-            status_changes = result.get("statusChanges", [])
-            print(f"\n✅ Triggered {len(status_changes)} status change(s)")
-            for change in status_changes:
-                print(f"   - {change.get('componentName')}: "
-                      f"{change.get('previousStatus')} → {change.get('newStatus')}")
 
     except AuthenticationError as e:
         print(f"❌ Authentication Error: {e}", file=sys.stderr)
