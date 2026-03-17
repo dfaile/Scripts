@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
-"""List incidents grouped by day.
+"""List disruptions (Mar 16 API).
 
-This script retrieves incidents that are automatically derived from status changes
-where components transition to non-operational states. Features:
-- Incidents grouped by day
-- Filter by ongoing or resolved status
-- Incident details including duration, severity, and related issue reports
+Uses GET /status-page/disruptions?state=impacting|cleared&limit=&offset=
+Returns paginated ListDisruptionsResult: disruptions[], total, limit, offset.
+Disruption shape: id (encoded), startTime, endTime, isCleared, originComponent,
+affectedComponents, severity, source, etc.
 
-Incidents are created automatically when a component's status changes to
-degradedPerformance or majorOutage, and resolved when it returns to operational.
+Optionally use --timeline to get disruptions grouped by day via POST /disruptions/timeline.
 
 Usage:
-    python list_incidents.py [--ongoing | --resolved]
+    python list_incidents.py [--impacting | --cleared] [--limit N] [--timeline]
 
 Options:
-    --ongoing: Show only ongoing incidents
-    --resolved: Show only resolved incidents
-    (no flag): Show all incidents
+    --impacting: state=impacting (only impacting)
+    --cleared: state=cleared (only cleared)
+    (no flag): no state filter (all disruptions)
+    --limit N: max results (default 50)
+    --timeline: use POST /disruptions/timeline for day-grouped view
 
 Examples:
-    python list_incidents.py
-    python list_incidents.py --ongoing
-    python list_incidents.py --resolved
+    python list_incidents.py --impacting
+    python list_incidents.py --cleared --limit 20
+    python list_incidents.py --timeline
 
 Environment Variables:
-    NOBL9_API_TOKEN: Your Nobl9 API token (required)
-    NOBL9_ORG: Your organization ID (required)
+    NOBL9_API_TOKEN or NOBL9_CLIENT_ID+NOBL9_CLIENT_SECRET, NOBL9_ORG (required)
 """
 import sys
 import argparse
@@ -33,101 +32,102 @@ import argparse
 from examples.common import get_config, StatusPageClient, pretty_print, APIError
 
 
-def list_incidents(client: StatusPageClient, ongoing: bool = None) -> dict:
-    """List incidents.
-
-    Args:
-        client: StatusPageClient instance.
-        ongoing: Filter by ongoing status (True/False/None for all).
-
-    Returns:
-        Incidents grouped by day.
-    """
-    params = {}
-    if ongoing is not None:
-        params["ongoing"] = str(ongoing).lower()
-
-    return client.get("/status-page/incidents", params=params)
+def list_disruptions(
+    client: StatusPageClient,
+    state: str = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List disruptions (paginated). state=impacting|cleared or None for all."""
+    params = {"limit": str(limit), "offset": str(offset)}
+    if state:
+        params["state"] = state
+    return client.get_disruptions(params=params)
 
 
-def print_incidents_summary(days: list) -> None:
-    """Print incidents in a summary format.
+def get_disruptions_timeline(client: StatusPageClient, impacting_only: bool = None) -> dict:
+    """Get disruptions grouped by day (POST /disruptions/timeline)."""
+    body = {}
+    if impacting_only is not None:
+        body["impactingOnly"] = impacting_only
+    return client.get_disruptions_timeline(body if body else {})
 
-    Args:
-        days: List of day incident groups.
-    """
-    if not days:
-        print("No incidents found.")
+
+def print_disruptions_summary(data: dict, use_timeline: bool = False) -> None:
+    """Print summary from ListDisruptionsResult or timeline result."""
+    if use_timeline:
+        days = data.get("days") or []
+        if not days:
+            print("No disruptions in timeline.")
+            return
+        total = sum(d.get("count", 0) for d in days)
+        print(f"\nTotal disruptions: {total} across {len(days)} days")
+        print("\nDisruption Timeline:")
+        print("-" * 80)
+        for day in days[:14]:
+            print(f"\n📅 {day.get('date')}: {day.get('count')} disruption(s)")
+            for disruption in (day.get("disruptions") or [])[:5]:
+                origin = (disruption.get("originComponent") or {}).get("name", "?")
+                res = "✅" if disruption.get("isCleared") else "🔴"
+                print(f"  {res} {origin} - {disruption.get('severity')}  start={disruption.get('startTime')}")
         return
 
-    total_incidents = sum(day.get("count", 0) for day in days)
-    print(f"\nTotal incidents: {total_incidents} across {len(days)} days")
-    print("\nIncident Summary:")
+    disruptions = data.get("disruptions") or []
+    total = data.get("total", len(disruptions))
+    limit = data.get("limit", 0)
+    offset = data.get("offset", 0)
+    print(f"\nDisruptions: showing {len(disruptions)} (offset {offset}, limit {limit}), total {total}")
     print("-" * 80)
-
-    for day in days:
-        print(f"\n📅 {day.get('date')}: {day.get('count')} incident(s)")
-
-        for incident in day.get("incidents", []):
-            severity_emoji = {
-                "degradedPerformance": "⚠️",
-                "majorOutage": "❌",
-            }.get(incident.get("severity", ""), "❓")
-
-            status_emoji = {
-                "ongoing": "🔴",
-                "resolved": "✅",
-            }.get(incident.get("status", ""), "❓")
-
-            print(f"\n  {severity_emoji} {incident.get('componentName')} - {status_emoji} {incident.get('status')}")
-            print(f"     Started: {incident.get('startedAt')}")
-
-            if incident.get("endedAt"):
-                print(f"     Ended: {incident.get('endedAt')}")
-                print(f"     Duration: {incident.get('duration')} seconds")
-            else:
-                print(f"     Duration: {incident.get('duration')} seconds (ongoing)")
-
-            if incident.get("startComment"):
-                print(f"     Comment: {incident.get('startComment')}")
-
-            issue_count = incident.get("issueCount", 0)
-            if issue_count > 0:
-                print(f"     Issue reports: {issue_count}")
+    if not disruptions:
+        print("No disruptions found.")
+        return
+    for disruption in disruptions:
+        origin = disruption.get("originComponent") or {}
+        origin_name = origin.get("name", "?")
+        res = "✅" if disruption.get("isCleared") else "🔴"
+        print(f"\n  {res} id={disruption.get('id')}  {disruption.get('severity')}  origin: {origin_name}")
+        print(f"     start={disruption.get('startTime')}  end={disruption.get('endTime')}")
+        if disruption.get("title"):
+            print(f"     title: {disruption.get('title')}")
 
 
 def main():
     """Main function."""
-    parser = argparse.ArgumentParser(description="List incidents grouped by day")
+    parser = argparse.ArgumentParser(description="List disruptions (Mar 16 API)")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--ongoing", action="store_true", help="Show only ongoing incidents")
-    group.add_argument("--resolved", action="store_true", help="Show only resolved incidents")
-
+    group.add_argument("--impacting", action="store_true", help="state=impacting (impacting only)")
+    group.add_argument("--cleared", action="store_true", help="state=cleared only")
+    parser.add_argument("--limit", type=int, default=50, help="Max results (default 50)")
+    parser.add_argument("--timeline", action="store_true", help="Use POST /disruptions/timeline (day-grouped)")
     args = parser.parse_args()
 
     try:
         config = get_config()
         client = StatusPageClient(config)
 
-        # Determine filter
-        ongoing_filter = None
-        if args.ongoing:
-            ongoing_filter = True
-            print("Fetching ongoing incidents...")
-        elif args.resolved:
-            ongoing_filter = False
-            print("Fetching resolved incidents...")
+        if args.timeline:
+            impacting_only = None
+            if args.impacting:
+                impacting_only = True
+            elif args.cleared:
+                impacting_only = False
+            print("Fetching disruptions timeline...")
+            result = get_disruptions_timeline(client, impacting_only=impacting_only)
+            print_disruptions_summary(result, use_timeline=True)
         else:
-            print("Fetching all incidents...")
+            state = None
+            if args.impacting:
+                state = "impacting"
+                print("Fetching impacting disruptions...")
+            elif args.cleared:
+                state = "cleared"
+                print("Fetching cleared disruptions...")
+            else:
+                print("Fetching all disruptions...")
+            result = list_disruptions(client, state=state, limit=args.limit)
+            print_disruptions_summary(result)
 
-        result = list_incidents(client, ongoing_filter)
-
-        # Print summary
-        days = result.get("days", [])
-        print_incidents_summary(days)
-
-        # Print full JSON
-        print("\n\nFull Incident Details:")
+        print("\n\nFull response:")
         print("=" * 80)
         pretty_print(result)
 

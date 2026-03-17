@@ -1,71 +1,55 @@
 # Usage Examples
 
-Detailed examples for creating and managing incidents.
+Examples for reporting issues and managing disruptions (Mar 16 API).
 
 ## Table of Contents
 
-1. [Creating External Issues (Monitoring)](#creating-external-issues)
-2. [Creating User Issues](#creating-user-issues)
-3. [Changing Component Status](#changing-component-status)
-4. [Listing Incidents](#listing-incidents)
-5. [Complete Workflows](#complete-workflows)
+1. [External issues (monitoring)](#creating-external-issues)
+2. [User-reported issues](#creating-user-issues)
+3. [Changing component status (disruptions)](#changing-component-status)
+4. [Listing disruptions](#listing-disruptions)
+5. [Workflows](#workflows)
+6. [Python integration](#python-integration)
 
 ---
 
 ## Creating External Issues
 
-For automated monitoring systems (Datadog, Prometheus, etc.).
+External issue API: report only. `requestedBy` is required (1–50 chars). There is no `statusChange` in the API; to change status, use the disruption scripts below.
 
-### Basic External Issue
+### Basic external issue
 
 ```bash
 python3 -m examples.issues.create_external_issue "My Component" \
-    --comment "Service experiencing issues"
-```
-
-### With Status Change
-
-```bash
-python3 -m examples.issues.create_external_issue "API Service" \
-    --status majorOutage \
-    --comment "500 errors exceeding threshold" \
+    --comment "Service experiencing issues" \
     --requested-by "monitoring-system"
 ```
 
-### With Status Propagation
+### With optional URL and timestamp
 
 ```bash
-python3 -m examples.issues.create_external_issue "Database" \
-    --status degradedPerformance \
-    --comment "High query latency" \
-    --propagate
+python3 -m examples.issues.create_external_issue "API Service" \
+    --comment "500 errors exceeding threshold" \
+    --requested-by "datadog" \
+    --url "https://grafana.example.com/alert/123" \
+    --occurred-at "2026-03-16T10:30:00Z"
 ```
 
-### Full Example with All Options
+### Verify component and list components
 
 ```bash
-python3 -m examples.issues.create_external_issue "Payment Service" \
-    --status majorOutage \
-    --comment "Payment processing failures: 95% error rate" \
-    --occurred-at "2026-02-05T10:30:00Z" \
-    --requested-by "datadog" \
-    --propagate \
-    --verify
+python3 -m examples.issues.create_external_issue "API Service" --comment "Test" --verify
+python3 -m examples.issues.create_external_issue --list-components
 ```
 
 ---
 
 ## Creating User Issues
 
-For manual incident reporting.
-
-### Basic User Issue
-
 ```bash
-# Get component ID first
-python3 -m examples.components.list_components
+# List components first if needed
+python3 -m examples.issues.create_external_issue --list-components
 
-# Create issue
 python3 -m examples.issues.create_issue <component-id> \
     --comment "Users reporting slow page loads"
 ```
@@ -74,31 +58,19 @@ python3 -m examples.issues.create_issue <component-id> \
 
 ## Changing Component Status
 
-Changes component status and automatically creates incidents.
+Status is driven by **disruptions**. Use `change_status` to register or clear a disruption.
 
-### Change to Major Outage
+### Set to degraded or major outage
 
 ```bash
 python3 -m examples.status_changes.change_status <component-id> majorOutage \
     --comment "Service completely down"
-```
 
-### Change to Degraded Performance
-
-```bash
 python3 -m examples.status_changes.change_status <component-id> degradedPerformance \
     --comment "High latency observed"
 ```
 
-### With Propagation to Parents
-
-```bash
-python3 -m examples.status_changes.change_status <component-id> partialOutage \
-    --comment "Some features unavailable" \
-    --propagate
-```
-
-### Restore to Operational
+### Restore to operational (clear disruption)
 
 ```bash
 python3 -m examples.status_changes.change_status <component-id> operational \
@@ -107,172 +79,114 @@ python3 -m examples.status_changes.change_status <component-id> operational \
 
 ---
 
-## Listing Incidents
+## Listing Disruptions
 
-View incident history with various filters.
-
-### List All Incidents
+### List impacting disruptions
 
 ```bash
-python3 -m examples.incidents.list_incidents
+python3 -m examples.incidents.list_incidents --impacting
 ```
 
-### List Only Ongoing Incidents
+### List cleared disruptions
 
 ```bash
-python3 -m examples.incidents.list_incidents --ongoing
+python3 -m examples.incidents.list_incidents --cleared --limit 20
 ```
 
-### List Only Resolved Incidents
+### Day-grouped timeline
 
 ```bash
-python3 -m examples.incidents.list_incidents --resolved
+python3 -m examples.incidents.list_incidents --timeline
 ```
 
 ---
 
-## Complete Workflows
+## Workflows
 
-End-to-end incident management patterns.
-
-### Incident Workflow
-
-Complete lifecycle: Create issue → Change status → Resolve
+### Disruption workflow (full lifecycle)
 
 ```bash
 python3 -m examples.workflows.incident_workflow <component-id> majorOutage
 ```
 
-### Monitoring Integration Workflow
+Runs: create issue → register disruption → list impacting → clear disruption → show history.
 
-Simulates monitoring system alerts:
-
-```bash
-# Warning alert
-python3 -m examples.workflows.monitoring_integration "Component Name" warning
-
-# Critical alert
-python3 -m examples.workflows.monitoring_integration "Component Name" critical
-
-# Resolution
-python3 -m examples.workflows.monitoring_integration "Component Name" resolved
-```
-
----
-
-## Monitoring System Integration
-
-### Datadog Example
+### Monitoring integration (external issue + optional disruption)
 
 ```bash
-# In Datadog webhook handler
-python3 -m examples.issues.create_external_issue "${COMPONENT_NAME}" \
-    --status majorOutage \
-    --comment "Alert: ${ALERT_NAME} - ${ALERT_MESSAGE}" \
-    --requested-by "datadog"
-```
+# Report issue and register disruption for "warning"
+python3 -m examples.workflows.monitoring_integration "API Service" warning --requested-by prometheus
 
-### Prometheus Example
+# Critical
+python3 -m examples.workflows.monitoring_integration "Database" critical --requested-by datadog
 
-```bash
-# In Alertmanager webhook receiver
-python3 -m examples.issues.create_external_issue "${SERVICE_NAME}" \
-    --status degradedPerformance \
-    --comment "Alert: ${ALERT_NAME}" \
-    --requested-by "prometheus"
-```
-
-### PagerDuty Example
-
-```bash
-# When incident created in PagerDuty
-python3 -m examples.issues.create_external_issue "${AFFECTED_SERVICE}" \
-    --status "${SEVERITY}" \
-    --comment "PagerDuty Incident #${INCIDENT_ID}: ${TITLE}" \
-    --requested-by "pagerduty"
+# Resolved (clears disruption)
+python3 -m examples.workflows.monitoring_integration "API Service" resolved
 ```
 
 ---
 
 ## Python Integration
 
-### Using in Your Python Code
+### Report external issue (no statusChange)
 
 ```python
 from examples.common import get_config, StatusPageClient
 
-# Initialize
 config = get_config()
 client = StatusPageClient(config)
 
-# Create external issue
 result = client.post_external("/status-page/issues/external", {
     "componentName": "API Service",
-    "occurredAt": "2026-02-05T10:30:00Z",
+    "occurredAt": "2026-03-16T10:30:00Z",
     "comment": "High error rate detected",
-    "requestedBy": "monitoring-system",
-    "statusChange": {
-        "status": "majorOutage",
-        "propagateUp": False
-    }
+    "requestedBy": "prometheus",
 })
-
-print(f"Created {len(result['reports'])} issue report(s)")
+print(len(result.get("reports", [])), "report(s) created")
 ```
 
----
-
-## Advanced Usage
-
-### Custom Retry Configuration
+### Change status via disruptions
 
 ```python
 from examples.common import get_config, StatusPageClient
+from datetime import datetime, timezone
 
 config = get_config()
+client = StatusPageClient(config)
+component_id = "<uuid>"
 
-# More aggressive retries
-client = StatusPageClient(
-    config,
-    max_retries=5,
-    initial_backoff=2.0,
-    max_backoff=60.0
-)
+# Register disruption (degraded or majorOutage)
+client.register_disruption({
+    "originComponentId": component_id,
+    "severity": "majorOutage",
+    "startTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "comment": "Outage detected",
+})
 
-result = client.get("/status-page/status")
+# Later: clear disruption (get id from component details or list_component_disruptions)
+# client.clear_disruption(disruption_id, {"endTime": "...", "comment": "Resolved"})
 ```
 
-### Error Handling
+### Error handling
 
 ```python
 from examples.common import (
     StatusPageClient,
     TransientAPIError,
     AuthenticationError,
-    NotFoundError
+    NotFoundError,
 )
 
 try:
     result = client.post_external("/status-page/issues/external", data)
 except TransientAPIError as e:
-    print(f"API temporarily unavailable: {e}")
+    print("API temporarily unavailable:", e)
 except AuthenticationError as e:
-    print(f"Authentication failed: {e}")
+    print("Authentication failed:", e)
 except NotFoundError as e:
-    print(f"Component not found: {e}")
+    print("Component not found:", e)
 ```
 
 ---
 
-## Tips and Best Practices
-
-1. **Use External Issues for Monitoring** - Automation-friendly API
-2. **Verify Component Names** - Use `--verify` flag to check before creating
-3. **Add Context in Comments** - Include alert details, metrics, etc.
-4. **Use Descriptive Requested-By** - Identify monitoring system
-5. **Propagate Carefully** - Only propagate when parent should be affected
-6. **Test in Non-Production** - Verify integration before production
-
----
-
-For more information, see the README.md and inline script documentation.
+For more, see README.md and script docstrings.

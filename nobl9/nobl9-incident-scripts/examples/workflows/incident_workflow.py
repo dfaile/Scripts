@@ -1,56 +1,49 @@
 #!/usr/bin/env python3
-"""Complete incident workflow demonstration.
+"""Complete disruption workflow demonstration (Mar 16 API).
 
-This script demonstrates a complete incident lifecycle:
-1. Create an issue report for a component
-2. Change component status to degraded/outage
-3. Monitor issue count
-4. Resolve the incident by returning to operational status
-
-This workflow shows how to manage an incident from detection to resolution.
+Demonstrates disruption-driven status lifecycle:
+1. Create an issue report for the component
+2. Register a disruption (POST /status-page/disruptions) for the component
+3. List impacting disruptions (GET /disruptions?state=impacting)
+4. Clear the disruption (POST /disruptions/{id}/clear) using id from component impactingDisruption
+5. Show disruption history via GET component details
 
 Usage:
     python incident_workflow.py <component_id> <severity>
 
 Arguments:
     component_id: UUID of the component
-    severity: Incident severity (degradedPerformance or majorOutage)
+    severity: degradedPerformance or majorOutage
 
 Example:
     python incident_workflow.py 4c91326b-81f3-47aa-b2b7-da2d1da3e298 degradedPerformance
 
 Environment Variables:
-    NOBL9_API_TOKEN: Your Nobl9 API token (required)
-    NOBL9_ORG: Your organization ID (required)
+    NOBL9_API_TOKEN or NOBL9_CLIENT_ID+NOBL9_CLIENT_SECRET, NOBL9_ORG (required)
 """
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from examples.common import get_config, StatusPageClient, pretty_print, APIError
+from examples.status_changes.change_status import _get_impacting_disruption_id_for_component
 
 
-def run_incident_workflow(
+def run_disruption_workflow(
     client: StatusPageClient,
     component_id: str,
     severity: str,
 ) -> None:
-    """Run complete incident workflow.
-
-    Args:
-        client: StatusPageClient instance.
-        component_id: Component UUID.
-        severity: Incident severity.
-    """
+    """Run complete disruption workflow (Mar 16 disruption-driven API)."""
     print("=" * 80)
-    print("INCIDENT WORKFLOW DEMONSTRATION")
+    print("DISRUPTION WORKFLOW DEMONSTRATION (Mar 16 API)")
     print("=" * 80)
 
     # Step 1: Create issue report
     print("\n[Step 1] Creating issue report...")
     issue_payload = {
         "componentId": component_id,
-        "occurredAt": datetime.utcnow().isoformat() + "Z",
+        "occurredAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "comment": f"Detected issue - triggering {severity} incident",
     }
     issue = client.post("/status-page/issues", issue_payload)
@@ -59,79 +52,71 @@ def run_incident_workflow(
 
     time.sleep(1)
 
-    # Step 2: Change status to trigger incident
-    print(f"\n[Step 2] Changing component status to {severity}...")
-    status_change_payload = {
-        "status": severity,
-        "comment": "Incident detected - investigating",
-        "propagateUp": False,
+    # Step 2: Create incident (replaces old change-status)
+    print(f"\n[Step 2] Registering disruption (severity={severity})...")
+    disruption_payload = {
+        "originComponentId": component_id,
+        "severity": severity,
+        "startTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "comment": "Disruption detected - investigating",
+        "source": "manual",
     }
-    status_change = client.post(
-        f"/status-page/components/{component_id}/change-status",
-        status_change_payload,
-    )
-    print(f"✅ Status changed from {status_change.get('previousStatus')} to {status_change.get('newStatus')}")
-    pretty_print(status_change)
+    client.register_disruption(disruption_payload)
+    print("✅ Disruption registered (204)")
 
     time.sleep(1)
 
-    # Step 3: Check ongoing incidents
-    print("\n[Step 3] Checking ongoing incidents...")
-    incidents = client.get("/status-page/incidents", {"ongoing": "true"})
-    ongoing_count = sum(day.get("count", 0) for day in incidents.get("days", []))
-    print(f"✅ Found {ongoing_count} ongoing incident(s)")
-    pretty_print(incidents)
+    # Step 3: List impacting disruptions
+    print("\n[Step 3] Checking impacting disruptions...")
+    result = client.get_disruptions({"state": "impacting", "limit": "50", "offset": "0"})
+    disruptions = result.get("disruptions") or []
+    total = result.get("total", len(disruptions))
+    print(f"✅ Found {total} impacting disruption(s)")
+    pretty_print(result)
 
     time.sleep(1)
 
-    # Step 4: Get issue summary
+    # Step 4: Issue summary
     print("\n[Step 4] Checking issue report summary...")
     summary = client.get("/status-page/issues/summary")
-    total = summary.get("totalCounts", {}).get("total", 0)
-    print(f"✅ Total active issues: {total}")
+    total_issues = summary.get("totalCounts", {}).get("total", 0)
+    print(f"✅ Total active issues: {total_issues}")
 
     time.sleep(1)
 
-    # Step 5: Simulate investigation and create update
-    print("\n[Step 5] Adding investigation update (simulated)...")
-    print("   (In production, you might create additional issue reports here)")
-    time.sleep(2)
-
-    # Step 6: Resolve incident
-    print("\n[Step 6] Resolving incident - returning to operational status...")
-    resolve_payload = {
-        "status": "operational",
+    # Step 5: Clear disruption (get id from component impactingDisruption, then clear)
+    print("\n[Step 5] Clearing disruption...")
+    disruption_id = _get_impacting_disruption_id_for_component(client, component_id)
+    clear_payload = {
+        "endTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "comment": "Issue resolved - service restored",
-        "propagateUp": False,
     }
-    resolved = client.post(
-        f"/status-page/components/{component_id}/change-status",
-        resolve_payload,
-    )
-    print(f"✅ Status changed from {resolved.get('previousStatus')} to {resolved.get('newStatus')}")
-    pretty_print(resolved)
+    client.clear_disruption(disruption_id, clear_payload)
+    print(f"✅ Disruption {disruption_id} cleared")
 
     time.sleep(1)
 
-    # Step 7: Verify incident is resolved
-    print("\n[Step 7] Verifying incident resolution...")
-    final_incidents = client.get("/status-page/incidents", {"ongoing": "true"})
-    final_count = sum(day.get("count", 0) for day in final_incidents.get("days", []))
-    print(f"✅ Remaining ongoing incidents: {final_count}")
+    # Step 6: Verify
+    print("\n[Step 6] Verifying disruption clearance...")
+    final_result = client.get_disruptions({"state": "impacting", "limit": "50", "offset": "0"})
+    final_count = final_result.get("total", 0)
+    print(f"✅ Remaining impacting disruptions: {final_count}")
 
-    # Step 8: Get status history
-    print("\n[Step 8] Retrieving status history...")
-    history = client.get(f"/status-page/components/{component_id}/status-changes")
-    history_count = len(history.get("history", []))
-    print(f"✅ Status history contains {history_count} record(s)")
-    print("\nRecent status changes:")
-    for change in history.get("history", [])[:5]:  # Show last 5
-        print(f"  - {change.get('changedAt')}: {change.get('previousStatus')} → {change.get('newStatus')}")
-        if change.get("comment"):
-            print(f"    Comment: {change.get('comment')}")
+    # Step 7: Disruption history (GET component details)
+    print("\n[Step 7] Retrieving disruption history for component...")
+    details = client.get(f"/status-page/components/{component_id}")
+    impacting = details.get("impactingDisruption")
+    history = details.get("disruptionHistory") or {}
+    days_list = history.get("days") or []
+    print(f"✅ Impacting disruption for component: {'present' if impacting else 'none'}")
+    print(f"✅ 90-day disruption history: {len(days_list)} days with disruptions")
+    if days_list:
+        print("Recent days with disruptions:")
+        for day in days_list[:5]:
+            print(f"  - {day.get('date')}: {day.get('disruptions')} disruptions")
 
     print("\n" + "=" * 80)
-    print("INCIDENT WORKFLOW COMPLETED SUCCESSFULLY")
+    print("DISRUPTION WORKFLOW COMPLETED SUCCESSFULLY")
     print("=" * 80)
 
 
@@ -155,7 +140,7 @@ def main():
         config = get_config()
         client = StatusPageClient(config)
 
-        run_incident_workflow(client, component_id, severity)
+        run_disruption_workflow(client, component_id, severity)
 
     except APIError as e:
         print(f"\n❌ API Error: {e}", file=sys.stderr)

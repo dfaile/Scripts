@@ -1,46 +1,37 @@
 #!/usr/bin/env python3
-"""External monitoring system integration example.
+"""External monitoring + disruption integration example (Mar 16 API).
 
-This script simulates an external monitoring system (e.g., Prometheus, Datadog)
-integrating with the Nobl9 Status Page API. It demonstrates:
+Demonstrates:
 1. Receiving an alert payload from a monitoring system
-2. Creating an external issue report
-3. Triggering status changes based on alert severity
-
-This example shows how to integrate external monitoring tools with the status page.
+2. Creating an external issue report (requestedBy required; no statusChange in API)
+3. Creating or clearing a disruption separately to change component status
+   (resolve component name to id, then POST /status-page/disruptions or
+    POST /status-page/disruptions/{id}/clear).
 
 Usage:
-    python monitoring_integration.py <component_name> <alert_severity>
+    python monitoring_integration.py <component_name> <alert_severity> [--requested-by ID]
 
 Arguments:
-    component_name: Name of the component (will match all components with this name)
-    alert_severity: Alert severity level (warning, critical, resolved)
+    component_name: Name of the component (may match multiple)
+    alert_severity: warning, critical, or resolved
+
+Options:
+    --requested-by: Required by API (1-50 chars). Default: prometheus-alertmanager
+    --url: Optional link to source alert (uri, max 2048)
 
 Examples:
-    # Warning alert - trigger degraded performance
-    python monitoring_integration.py "API Service" warning
-
-    # Critical alert - trigger major outage
+    python monitoring_integration.py "API Service" warning --requested-by prometheus
     python monitoring_integration.py "Database" critical
 
-    # Resolution - return to operational
-    python monitoring_integration.py "API Service" resolved
-
 Environment Variables:
-    NOBL9_ORG: Your organization ID (required)
-    NOBL9_BASE_URL: API base URL (optional)
-
-Note: This endpoint does NOT require NOBL9_API_TOKEN.
+    NOBL9_ORG (required). NOBL9_CLIENT_ID + NOBL9_CLIENT_SECRET for auth.
 """
 import sys
-import json
-from datetime import datetime
+from datetime import datetime, timezone
 
-from examples.common import StatusPageClient, pretty_print, APIError
-from examples.common.config import Config
+from examples.common import get_config, StatusPageClient, pretty_print, APIError
 
 
-# Simulated alert payloads from external systems
 ALERT_EXAMPLES = {
     "prometheus": {
         "alertname": "HighErrorRate",
@@ -60,14 +51,7 @@ ALERT_EXAMPLES = {
 
 
 def map_severity_to_status(alert_severity: str) -> str:
-    """Map alert severity to component status.
-
-    Args:
-        alert_severity: Alert severity (warning, critical, resolved).
-
-    Returns:
-        Component status.
-    """
+    """Map alert severity to disruption-driven component status."""
     mapping = {
         "warning": "degradedPerformance",
         "critical": "majorOutage",
@@ -76,60 +60,58 @@ def map_severity_to_status(alert_severity: str) -> str:
     return mapping.get(alert_severity.lower(), "degradedPerformance")
 
 
+def _flatten_components(components: list) -> list:
+    """Recursively flatten component tree to list of dicts."""
+    out = []
+    for c in components:
+        out.append(c)
+        if c.get("children"):
+            out.extend(_flatten_components(c["children"]))
+    return out
+
+
+def _component_ids_by_name(client: StatusPageClient, component_name: str) -> list:
+    """Resolve component name to list of component IDs (may match multiple)."""
+    resp = client.get("/status-page/components")
+    flat = _flatten_components(resp.get("components") or [])
+    return [c["id"] for c in flat if c.get("name") == component_name]
+
+
 def simulate_monitoring_alert(
     client: StatusPageClient,
     component_name: str,
     alert_severity: str,
+    requested_by: str,
+    url: str = None,
     monitoring_system: str = "prometheus",
 ) -> None:
-    """Simulate receiving and processing a monitoring alert.
-
-    Args:
-        client: StatusPageClient instance.
-        component_name: Component name to report for.
-        alert_severity: Alert severity.
-        monitoring_system: Which monitoring system (prometheus/datadog).
-    """
+    """Create external issue (requestedBy required; no statusChange). Optionally register/clear disruptions."""
     print("=" * 80)
-    print("EXTERNAL MONITORING INTEGRATION DEMONSTRATION")
+    print("EXTERNAL MONITORING + DISRUPTIONS INTEGRATION (Mar 16 API)")
     print("=" * 80)
 
-    # Step 1: Receive alert from monitoring system
     print(f"\n[Step 1] Receiving alert from {monitoring_system}...")
     alert_payload = ALERT_EXAMPLES.get(monitoring_system, ALERT_EXAMPLES["prometheus"])
-    print("Alert payload:")
     pretty_print(alert_payload)
 
-    # Step 2: Map alert to component and status
     print(f"\n[Step 2] Processing alert...")
     component_status = map_severity_to_status(alert_severity)
-    print(f"Alert severity: {alert_severity} → Component status: {component_status}")
+    print(f"Alert severity: {alert_severity} → derived status: {component_status}")
 
-    # Step 3: Create external issue report with status change
-    print(f"\n[Step 3] Creating external issue report for '{component_name}'...")
-
-    # Build comment from alert data
+    print(f"\n[Step 3] Creating external issue report for '{component_name}' (requestedBy required)...")
     if monitoring_system == "prometheus":
         comment = f"[{alert_payload['alertname']}] {alert_payload['summary']}: {alert_payload['description']}"
     else:
         comment = f"[{alert_payload['alert_type']}] {alert_payload['title']}: {alert_payload['message']}"
 
-    # Create external issue with status change
     issue_payload = {
         "componentName": component_name,
-        "occurredAt": datetime.utcnow().isoformat() + "Z",
+        "occurredAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "requestedBy": requested_by[:50],
         "comment": comment,
-        "requestedBy": monitoring_system,
     }
-
-    # Only include status change if not already operational
-    if component_status != "operational" or alert_severity == "resolved":
-        issue_payload["statusChange"] = {
-            "status": component_status,
-            "propagateUp": alert_severity == "critical",  # Propagate critical alerts
-        }
-
-    print("External issue payload:")
+    if url:
+        issue_payload["url"] = url[:2048]
     pretty_print(issue_payload)
 
     result = client.post_external("/status-page/issues/external", issue_payload)
@@ -137,72 +119,85 @@ def simulate_monitoring_alert(
     print("\n[Step 4] External issue result:")
     pretty_print(result)
 
-    # Step 5: Summary
     reports = result.get("reports", [])
-    status_changes = result.get("statusChanges", [])
-
     print("\n" + "=" * 80)
-    print("INTEGRATION SUMMARY")
+    print("SUMMARY")
     print("=" * 80)
     print(f"✅ Created {len(reports)} issue report(s)")
     for report in reports:
-        print(f"   - Issue ID: {report.get('id')}")
-        print(f"     Component ID: {report.get('componentId')}")
+        print(f"   - Issue ID: {report.get('id')}  Component ID: {report.get('componentId')}")
 
-    if status_changes:
-        print(f"✅ Triggered {len(status_changes)} status change(s)")
-        for change in status_changes:
-            print(f"   - Component: {change.get('componentName')}")
-            print(f"     Status: {change.get('previousStatus')} → {change.get('newStatus')}")
-    else:
-        print("ℹ️  No status changes triggered")
+    # Optional: create or clear disruptions to reflect severity (no statusChange in external issue)
+    if alert_severity.lower() in ("warning", "critical", "resolved"):
+        try:
+            comp_ids = _component_ids_by_name(client, component_name)
+            if not comp_ids:
+                print("\nℹ️  No components matched by name; skipping incident create/resolve.")
+            else:
+                if component_status in ("degradedPerformance", "majorOutage"):
+                    for cid in comp_ids:
+                        client.register_disruption(
+                            {
+                                "originComponentId": cid,
+                                "severity": component_status,
+                                "startTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                "comment": comment[:500] if comment else None,
+                                "source": "external",
+                            }
+                        )
+                    print(f"✅ Registered disruption(s) for {len(comp_ids)} component(s)")
+                elif component_status == "operational":
+                    from examples.status_changes.change_status import _get_impacting_disruption_id_for_component
 
-    print("\n💡 Next steps:")
-    if alert_severity in ["warning", "critical"]:
-        print("   - Monitoring system continues to track the issue")
-        print("   - When resolved, send another alert with severity 'resolved'")
-        print(f"   - Example: python {sys.argv[0]} '{component_name}' resolved")
-    else:
-        print("   - Issue has been resolved")
-        print("   - Component status restored to operational")
+                    for cid in comp_ids:
+                        try:
+                            disruption_id = _get_impacting_disruption_id_for_component(client, cid)
+                            client.clear_disruption(
+                                disruption_id,
+                                {
+                                    "endTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                    "comment": "Resolved via monitoring integration",
+                                },
+                            )
+                            print(f"✅ Cleared disruption for component {cid}")
+                        except Exception:
+                            # If there is no impacting disruption, skip silently
+                            continue
+        except Exception as e:
+            print(f"\nℹ️  Incident create/resolve skipped: {e}")
 
     print("=" * 80)
 
 
 def main():
     """Main function."""
-    if len(sys.argv) < 3:
-        print("Usage: python monitoring_integration.py <component_name> <alert_severity>", file=sys.stderr)
-        print("\nAlert severity options: warning, critical, resolved")
-        print("\nExamples:")
-        print('  python monitoring_integration.py "API Service" warning')
-        print('  python monitoring_integration.py "Database" critical')
-        print('  python monitoring_integration.py "API Service" resolved')
+    import argparse
+    parser = argparse.ArgumentParser(description="External monitoring integration (Mar 5 API)")
+    parser.add_argument("component_name", help="Component name to match")
+    parser.add_argument("alert_severity", choices=["warning", "critical", "resolved"],
+                        help="Alert severity")
+    parser.add_argument("--requested-by", default="prometheus-alertmanager",
+                        help="Requester id (required by API, 1-50 chars)")
+    parser.add_argument("--url", help="Optional link to source alert (uri, max 2048)")
+    parser.add_argument("--monitoring-system", default="prometheus", choices=["prometheus", "datadog"])
+    args = parser.parse_args()
+
+    requested_by = (args.requested_by or "prometheus-alertmanager").strip()
+    if not requested_by or len(requested_by) > 50:
+        print("Error: --requested-by must be 1-50 characters", file=sys.stderr)
         sys.exit(1)
-
-    component_name = sys.argv[1]
-    alert_severity = sys.argv[2]
-
-    if alert_severity.lower() not in ["warning", "critical", "resolved"]:
-        print("Error: Alert severity must be 'warning', 'critical', or 'resolved'", file=sys.stderr)
-        sys.exit(1)
-
-    # Allow optional monitoring system argument
-    monitoring_system = sys.argv[3] if len(sys.argv) > 3 else "prometheus"
-    if monitoring_system not in ALERT_EXAMPLES:
-        print(f"Warning: Unknown monitoring system '{monitoring_system}', using 'prometheus'")
-        monitoring_system = "prometheus"
 
     try:
-        # Only organization is required for external endpoint
-        config = Config()
-        if not config.organization:
-            raise ValueError("NOBL9_ORG environment variable is required")
-
+        config = get_config()
         client = StatusPageClient(config)
-
-        simulate_monitoring_alert(client, component_name, alert_severity, monitoring_system)
-
+        simulate_monitoring_alert(
+            client,
+            args.component_name,
+            args.alert_severity,
+            requested_by,
+            url=args.url,
+            monitoring_system=args.monitoring_system,
+        )
     except APIError as e:
         print(f"\n❌ API Error: {e}", file=sys.stderr)
         sys.exit(1)

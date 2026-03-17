@@ -1,15 +1,14 @@
-# Nobl9 Status Page: Incident Creation Scripts
+# Nobl9 Status Page: Scripts for Issues and Disruptions
 
-Python scripts for creating and managing incidents on the Nobl9 Status Page.
+Python scripts for reporting issues and managing **disruptions** on the Nobl9 Status Page (Mar 16 API). Component status is driven by disruptions; use these scripts to register or clear disruptions and to report issues from monitoring systems.
 
 ## Features
 
-✅ **Create Incidents from Monitoring Systems** - External issue API for automation
-✅ **Create User-Reported Incidents** - Manual issue reporting
-✅ **Change Component Status** - Automatically creates incidents
-✅ **List and Filter Incidents** - View incident history
-✅ **Complete Workflow Examples** - End-to-end patterns
-✅ **Automatic Retry Logic** - Resilient to transient API errors
+- **Report issues from monitoring** – External issue API (e.g. Prometheus, Datadog); `requestedBy` required; no status change in the API
+- **Change component status** – Via disruptions: register (degraded/majorOutage) or clear (operational)
+- **List disruptions** – Impacting, cleared, or timeline view
+- **Workflows** – End-to-end disruption lifecycle and monitoring integration
+- **Retry logic** – Automatic retry with backoff for transient API errors
 
 ## Quick Start
 
@@ -19,7 +18,7 @@ Python scripts for creating and managing incidents on the Nobl9 Status Page.
 pip install -r requirements.txt
 ```
 
-Required: Python 3.7 or higher
+Requires Python 3.7+.
 
 ### 2. Configure Credentials
 
@@ -28,7 +27,7 @@ cp .env.example .env
 # Edit .env with your Nobl9 credentials
 ```
 
-Get your credentials from: https://app.nobl9.com → Settings → API Access
+Get credentials from: https://app.nobl9.com → Settings → API Access
 
 ### 3. Test Connection
 
@@ -36,206 +35,119 @@ Get your credentials from: https://app.nobl9.com → Settings → API Access
 python3 test_connection.py
 ```
 
-Expected output:
-```
-✅ Configuration loaded
-✅ Authentication successful!
-```
+Expected: `✅ Configuration loaded` and `✅ Authentication successful!`
 
-### 4. Create Your First Incident
+### 4. Run Scripts
 
-#### List existing incidents:
+**List disruptions (impacting or cleared):**
 ```bash
-python3 -m examples.incidents.list_incidents
+python3 -m examples.incidents.list_incidents --impacting
+python3 -m examples.incidents.list_incidents --timeline
 ```
 
-#### Change component status (creates incident):
+**Change component status (via disruptions):**
 ```bash
 python3 -m examples.status_changes.change_status <component-id> majorOutage --comment "Service down"
+python3 -m examples.status_changes.change_status <component-id> operational --comment "Resolved"
 ```
 
-#### Create external issue from monitoring:
+**Create external issue from monitoring (report only; use change_status or workflow to change status):**
 ```bash
 python3 -m examples.issues.create_external_issue "Component Name" \
-    --status majorOutage \
-    --comment "High error rate detected"
+    --comment "High error rate detected" \
+    --requested-by prometheus
+```
+
+**Full disruption workflow:**
+```bash
+python3 -m examples.workflows.incident_workflow <component-id> majorOutage
 ```
 
 ## Available Scripts
 
-### Incident Management
-- `examples/incidents/list_incidents.py` - List and filter incidents (--ongoing, --resolved)
+### Disruption listing
+- `examples/incidents/list_incidents.py` – List disruptions (`--impacting`, `--cleared`, `--timeline`, `--limit`)
 
-### Issue Creation
-- `examples/issues/create_issue.py` - Create user-reported issue
-- `examples/issues/create_external_issue.py` - Create issue from monitoring system
-- `examples/issues/list_issues.py` - List all issues
-- `examples/issues/get_issue_summary.py` - Get issue statistics
+### Issue creation
+- `examples/issues/create_issue.py` – Create user-reported issue
+- `examples/issues/create_external_issue.py` – Create issue from monitoring (`--requested-by` required; no `--status` in API)
+- `examples/issues/list_issues.py` – List issues
+- `examples/issues/get_issue_summary.py` – Issue statistics
 
-### Status Changes
-- `examples/status_changes/change_status.py` - Change component status (triggers incident)
-- `examples/status_changes/get_status_history.py` - View status change history
+### Status (via disruptions)
+- `examples/status_changes/change_status.py` – Set status by registering or clearing a disruption
+- `examples/status_changes/get_status_history.py` – Component disruption history
 
 ### Workflows
-- `examples/workflows/incident_workflow.py` - Complete incident lifecycle
-- `examples/workflows/monitoring_integration.py` - Monitoring integration pattern
+- `examples/workflows/incident_workflow.py` – Disruption lifecycle (issue → register → list → clear → history)
+- `examples/workflows/monitoring_integration.py` – External issue + optional register/clear disruption
 
 ## Authentication
 
-### Client Credentials (Recommended)
-
-In your `.env` file:
+**Client credentials (recommended)** – in `.env`:
 ```bash
 NOBL9_CLIENT_ID=your_client_id_here
 NOBL9_CLIENT_SECRET=your_client_secret_here
 NOBL9_ORG=your_organization_id
 ```
 
-### API Token (Alternative)
-
+**API token (alternative):**
 ```bash
 NOBL9_API_TOKEN=your_token_here
 NOBL9_ORG=your_organization_id
 ```
 
-## Usage Examples
+## Mar 16 API Notes
 
-### Create Incident from Monitoring Alert
+- **Status is driven by disruptions.** There is no `statusChange` in the external-issue request or response. To change component status, register or clear a disruption (e.g. via `change_status.py` or the workflow scripts).
+- **External issues:** `requestedBy` is required (1–50 chars). Use `--requested-by` on the command line.
+- **Disruption endpoints:** `GET/POST /status-page/disruptions`, `POST .../disruptions/{id}/clear`, `POST .../disruptions/timeline`.
 
-```bash
-# Datadog, Prometheus, etc. → Nobl9
-python3 -m examples.issues.create_external_issue "API Service" \
-    --status majorOutage \
-    --comment "500 errors >50%" \
-    --requested-by "datadog"
-```
+## Monitoring integration (no statusChange in API)
 
-### Change Status with Propagation
-
-```bash
-# Change status and propagate to parent components
-python3 -m examples.status_changes.change_status <component-id> degradedPerformance \
-    --comment "High latency detected" \
-    --propagate
-```
-
-### Complete Incident Workflow
-
-```bash
-# Create issue → Change status → Update → Resolve
-python3 -m examples.workflows.incident_workflow <component-id> majorOutage
-```
-
-### List Ongoing Incidents
-
-```bash
-python3 -m examples.incidents.list_incidents --ongoing
-```
-
-## Features
-
-### Automatic Retry with Exponential Backoff
-
-All scripts include automatic retry for transient API errors (502, 503):
-- Default: 3 retries with exponential backoff
-- Configurable via StatusPageClient parameters
-- Transparent to users
-
-### Error Handling
-
-- **401 Unauthorized** - Check credentials
-- **404 Not Found** - Verify component ID
-- **502/503** - Automatic retry with backoff
-- **429 Rate Limit** - Wait and retry
-
-## Monitoring Integration Examples
-
-### Datadog Webhook
+Report an issue, then change status separately if needed:
 
 ```python
-# In your Datadog webhook handler
 from examples.common import get_config, StatusPageClient
 
 config = get_config()
 client = StatusPageClient(config)
 
-# On alert trigger
+# 1. Report issue (no statusChange in payload)
 client.post_external("/status-page/issues/external", {
     "componentName": "API Service",
-    "occurredAt": alert_time,
-    "comment": f"Alert: {alert_message}",
+    "occurredAt": "2026-03-16T12:00:00Z",
+    "comment": "High error rate",
     "requestedBy": "datadog",
-    "statusChange": {
-        "status": "majorOutage",
-        "propagateUp": False
-    }
 })
-```
 
-### Prometheus Alertmanager
-
-```python
-# In Alertmanager webhook receiver
-from examples.issues.create_external_issue import create_external_issue
-
-# On firing alert
-create_external_issue(
-    component_name="Database",
-    status="degradedPerformance",
-    comment=f"Alert: {alert_name}",
-    requested_by="prometheus"
-)
+# 2. To change status: register or clear a disruption (e.g. via client.register_disruption / clear_disruption)
+# Or run: python3 -m examples.status_changes.change_status <component-id> majorOutage --comment "..."
 ```
 
 ## Troubleshooting
 
-### "Authentication failed"
-- Verify credentials in `.env` file
-- Check organization ID is correct
-- Ensure Client ID and Secret match
+- **Authentication failed** – Check `.env`, `NOBL9_ORG`, and client ID/secret or token.
+- **Component not found** – Use `--list-components` (e.g. on `create_external_issue`) to see names; match case.
+- **Module not found** – Run from the package root; use `python3 -m examples.xxx` syntax.
 
-### "Component not found"
-- List components to get valid IDs
-- Verify component name spelling (for external issues)
+## Security
 
-### "Module not found"
-- Run from package root directory
-- Use `python3 -m examples.` syntax
-- Verify all `__init__.py` files are present
-
-### Retry messages appearing
-- Normal during API instability
-- Scripts automatically retry transient errors
-- No action needed unless all retries fail
+- Never commit `.env`. Commit only `.env.example` with placeholders.
+- Use client credentials or tokens with minimal scope; rotate if exposed.
 
 ## Requirements
 
-- Python 3.7 or higher
+- Python 3.7+
 - requests >= 2.31.0
 - python-dotenv >= 1.0.0
 
-See `requirements.txt` for full dependency list.
-
-## Security Best Practices
-
-✅ Never commit `.env` file to version control
-✅ Use client credentials (not API tokens) for production
-✅ Rotate credentials periodically
-✅ Use separate credentials per environment
-✅ Store credentials securely (vault, secrets manager)
-
 ## Support
 
-For assistance:
-- **Nobl9 Documentation**: https://docs.nobl9.com
-- **API Reference**: https://docs.nobl9.com/api
-- **Support Email**: support@nobl9.com
-
-## License
-
-Contact your Nobl9 representative for licensing information.
+- [Nobl9 Documentation](https://docs.nobl9.com)
+- [API Reference](https://docs.nobl9.com/api)
 
 ---
 
-**Version:** 1.0
-**Last Updated:** 2026-02-05
+**Version:** 2.0 (Mar 16 API – disruptions)  
+**Last updated:** 2026-03-16
